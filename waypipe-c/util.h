@@ -27,6 +27,7 @@
 
 #include <assert.h>
 #include <pthread.h>
+#include <signal.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -44,9 +45,25 @@
 #define DTRACE_PROBE3(provider, probe, parm1, parm2, parm3) (void)0
 #endif
 
-// On SIGINT, this is set to true. The main program should then cleanup ASAP
-extern bool shutdown_flag;
+// Set on SIGINT and by embedder shutdown requests. Use sig_atomic_t so signal
+// handlers can write it safely and worker threads re-read it in polling loops.
+extern volatile sig_atomic_t shutdown_flag;
 extern uint64_t inherited_fds[4];
+
+/** When true, waypipe is running in an embedded host process where forking
+ * worker subprocesses is undesirable. */
+void waypipe_set_embedded_no_fork_mode(bool enabled);
+bool waypipe_get_embedded_no_fork_mode(void);
+int waypipe_poll_timeout_ms(int requested_timeout_ms);
+
+uint64_t waypipe_get_current_owner_key(void);
+void waypipe_request_owner_shutdown(uint64_t owner_key);
+void waypipe_clear_owner_shutdown(uint64_t owner_key);
+bool waypipe_owner_shutdown_requested(uint64_t owner_key);
+bool waypipe_owner_shutdown_requested_current_thread(void);
+void waypipe_register_owned_child_pid(uint64_t owner_key, pid_t pid);
+void waypipe_unregister_owned_child_pid(pid_t pid);
+void waypipe_force_terminate_owned_children(uint64_t owner_key);
 
 void handle_sigint(int sig);
 
@@ -240,6 +257,11 @@ typedef void (*log_handler_func_t)(const char *file, int line,
  * NULL to disable log messages. */
 extern log_handler_func_t log_funcs[2];
 
+/** Optional sink for fully formatted waypipe log lines. Embedders can set this
+ * to mirror logs into their own buffers while preserving normal stderr output. */
+typedef void (*waypipe_log_sink_func_t)(const char *line, size_t len);
+extern waypipe_log_sink_func_t waypipe_log_sink;
+
 #ifdef WAYPIPE_REL_SRC_DIR
 #define WAYPIPE__FILE__                                                        \
 	((const char *)__FILE__ + sizeof(WAYPIPE_REL_SRC_DIR) - 1)
@@ -266,6 +288,18 @@ extern log_handler_func_t log_funcs[2];
  */
 bool wait_for_pid_and_clean(pid_t *target_pid, int *status, int options,
 		struct conn_map *map);
+
+/** Wait briefly for a child process to exit on its own without sending any
+ * signal. Returns true if the child exited and was reaped during the grace
+ * period, false otherwise.
+ */
+bool wait_for_child_process_exit(pid_t *target_pid, int *status,
+		int timeout_ms, struct conn_map *map, const char *label);
+
+/** Force a child process to terminate (SIGTERM then SIGKILL fallback), and
+ * reap it before returning. If the process is already gone, this is a no-op.
+ * On return, *target_pid is set to 0. */
+void force_terminate_child_process(pid_t *target_pid, const char *label);
 
 /** An unrecoverable error-- say, running out of file descriptors */
 #define ERR_FATAL -1

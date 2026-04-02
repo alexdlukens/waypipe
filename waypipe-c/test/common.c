@@ -380,8 +380,8 @@ void cleanup_state(struct test_state *s)
 {
 	cleanup_message_tracker(&s->glob.tracker);
 	cleanup_translation_map(&s->glob.map);
-	cleanup_render_data(&s->glob.render);
 	cleanup_hwcontext(&s->glob.render);
+	cleanup_render_data(&s->glob.render);
 	cleanup_thread_pool(&s->glob.threads);
 
 	for (int i = 0; i < s->nrcvd; i++) {

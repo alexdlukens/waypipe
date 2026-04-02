@@ -1082,7 +1082,7 @@ static int reconnect_loop(int linkfd, int progfd, struct int_window *recon_fds)
 		rcfs[1].fd = progfd;
 		rcfs[1].events = 0;
 		rcfs[1].revents = 0;
-		int r = poll(rcfs, 2, -1);
+		int r = poll(rcfs, 2, waypipe_poll_timeout_ms(-1));
 		if (r == -1) {
 			if (errno == EINTR) {
 				continue;
@@ -1526,8 +1526,8 @@ init_failure_cleanup:
 	cleanup_thread_pool(&g.threads);
 	cleanup_message_tracker(&g.tracker);
 	cleanup_translation_map(&g.map);
-	cleanup_render_data(&g.render);
 	cleanup_hwcontext(&g.render);
+	cleanup_render_data(&g.render);
 	free(way_msg.proto_read.data);
 	free(way_msg.proto_write.data);
 	free(way_msg.fds.data);

@@ -49,7 +49,7 @@
 
 #if defined(__linux__)
 /* memfd_create was introduced in glibc 2.27 */
-#if !defined(__GLIBC__) || (__GLIBC__ >= 2 && __GLIBC_MINOR__ >= 27)
+#if defined(__ANDROID__) || !defined(__GLIBC__) || (__GLIBC__ >= 2 && __GLIBC_MINOR__ >= 27)
 #define HAS_MEMFD 1
 #endif
 #endif

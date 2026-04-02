@@ -90,6 +90,7 @@ static const char usage_string[] =
 		"      --display D      server,ssh: the Wayland display name or path\n"
 		"      --drm-node R     set the local render node. default: /dev/dri/renderD128\n"
 		"      --remote-node R  ssh: set the remote render node path\n"
+		"      --remote-socket R ssh: set remote socket path prefix for ssh mode\n"
 		"      --remote-bin R   ssh: set the remote waypipe binary. default: waypipe\n"
 		"      --login-shell    server: if server CMD is empty, run a login shell\n"
 		"      --threads T      set thread pool size, default=hardware threads/2\n"
@@ -166,6 +167,10 @@ static void log_handler(const char *file, int line, enum log_level level,
 	}
 	msg[nwri++] = '\n';
 	msg[nwri] = 0;
+
+	if (waypipe_log_sink) {
+		waypipe_log_sink(msg, (size_t)nwri);
+	}
 
 	// single short writes are atomic for pipes, at least
 	(void)write(STDERR_FILENO, msg, (size_t)nwri);
@@ -453,6 +458,7 @@ static const bool feature_flags[] = {
 #define ARG_VSOCK 1013
 #define ARG_TITLE_PREFIX 1014
 #define ARG_SECCTX 1015
+#define ARG_REMOTE_SOCKET 1016
 
 static const struct option options[] = {
 		{"compress", required_argument, NULL, 'c'},
@@ -466,6 +472,7 @@ static const struct option options[] = {
 		{"unlink-socket", no_argument, NULL, ARG_UNLINK},
 		{"drm-node", required_argument, NULL, ARG_DRMNODE},
 		{"remote-node", required_argument, NULL, ARG_REMOTENODE},
+		{"remote-socket", required_argument, NULL, ARG_REMOTE_SOCKET},
 		{"remote-bin", required_argument, NULL, ARG_WAYPIPE_BINARY},
 		{"login-shell", no_argument, NULL, ARG_LOGIN_SHELL},
 		{"video", optional_argument, NULL, ARG_VIDEO},
@@ -492,7 +499,8 @@ static const struct arg_permissions arg_permissions[] = {
 		{ARG_ALLOW_TILED, MODE_SSH | MODE_CLIENT | MODE_SERVER},
 		{ARG_UNLINK, MODE_SERVER},
 		{ARG_DRMNODE, MODE_SSH | MODE_CLIENT | MODE_SERVER},
-		{ARG_REMOTENODE, MODE_SSH}, {ARG_WAYPIPE_BINARY, MODE_SSH},
+		{ARG_REMOTENODE, MODE_SSH}, {ARG_REMOTE_SOCKET, MODE_SSH},
+		{ARG_WAYPIPE_BINARY, MODE_SSH},
 		{ARG_LOGIN_SHELL, MODE_SERVER},
 		{ARG_VIDEO, MODE_SSH | MODE_CLIENT | MODE_SERVER},
 		{ARG_HWVIDEO, MODE_SSH | MODE_CLIENT | MODE_SERVER},
@@ -508,13 +516,24 @@ static const struct arg_permissions arg_permissions[] = {
 /* envp is nonstandard, so use environ */
 extern char **environ;
 
+static waypipe_ssh_inprocess_main_func_t g_waypipe_ssh_inprocess_main_func =
+		NULL;
+static void *g_waypipe_ssh_inprocess_main_user_data = NULL;
+
+void waypipe_set_ssh_inprocess_main_func(
+		waypipe_ssh_inprocess_main_func_t p_func, void *p_user_data)
+{
+	g_waypipe_ssh_inprocess_main_func = p_func;
+	g_waypipe_ssh_inprocess_main_user_data = p_user_data;
+}
+
 #ifdef HAS_SECURITY_CONTEXT
 int create_security_context(const char *sock_path, const char *engine,
 		const char *instance_id, const char *app_id);
 void close_security_context(void);
 #endif
 
-int main(int argc, char **argv)
+int waypipe_main(int argc, char **argv)
 {
 	bool help = false;
 	bool version = false;
@@ -524,6 +543,7 @@ int main(int argc, char **argv)
 	bool unlink_at_end = false;
 	bool login_shell = false;
 	char *remote_drm_node = NULL;
+	char *remote_socketpath = NULL;
 	char *comp_string = NULL;
 	char *nthread_string = NULL;
 	char *wayland_display = NULL;
@@ -671,6 +691,9 @@ int main(int argc, char **argv)
 			break;
 		case ARG_REMOTENODE:
 			remote_drm_node = optarg;
+			break;
+		case ARG_REMOTE_SOCKET:
+			remote_socketpath = optarg;
 			break;
 		case ARG_LOGIN_SHELL:
 			login_shell = true;
@@ -970,6 +993,7 @@ int main(int argc, char **argv)
 	} else {
 		struct sockaddr_un clientsock = {0};
 		char socket_folder[512] = {0};
+		char remote_socket_folder[512] = {0};
 		if (socketpath) {
 			if (strlen(socketpath) >= sizeof(socket_folder)) {
 				wp_error("Socket path prefix is too long\n");
@@ -987,6 +1011,17 @@ int main(int argc, char **argv)
 			strcpy(clientsock.sun_path, "waypipe");
 			strcpy(socket_folder, "/tmp/");
 			socketpath = "/tmp/waypipe";
+		}
+
+		if (remote_socketpath) {
+			if (strlen(remote_socketpath) >= sizeof(remote_socket_folder)) {
+				wp_error("Remote socket path prefix is too long\n");
+				close(cwd_fd);
+				return EXIT_FAILURE;
+			}
+			strcpy(remote_socket_folder, remote_socketpath);
+		} else {
+			strcpy(remote_socket_folder, socketpath);
 		}
 		if (strlen(clientsock.sun_path) +
 						sizeof("-server-88888888.sock") >=
@@ -1061,10 +1096,10 @@ int main(int argc, char **argv)
 			char remote_display[20];
 			if (!config.vsock) {
 				sprintf(serversock, "%s-server-%s.sock",
-						socketpath, rbytes);
+						remote_socket_folder, rbytes);
 				sprintf(linkage,
 						"%s-server-%s.sock:%s-client-%s.sock",
-						socketpath, rbytes, socketpath,
+						remote_socket_folder, rbytes, socketpath,
 						rbytes);
 			} else {
 				sprintf(serversock, "%d", config.vsock_port);
@@ -1194,17 +1229,56 @@ int main(int argc, char **argv)
 				arglist[offset + i] = argv[i];
 			}
 			arglist[argc + offset] = NULL;
-			int err = posix_spawnp(&conn_pid, arglist[0], NULL,
-					NULL, arglist, environ);
-			if (err) {
-				wp_error("Failed to spawn ssh process: %s",
-						strerror(err));
-				close(channelsock);
-				free(arglist);
-				return EXIT_FAILURE;
+			if (g_waypipe_ssh_inprocess_main_func) {
+				pid_t inprocess_pid = fork();
+				if (inprocess_pid == -1) {
+					wp_error("Failed to fork in-process ssh runner: %s",
+							strerror(errno));
+					close(channelsock);
+					free(arglist);
+					return EXIT_FAILURE;
+				} else if (inprocess_pid == 0) {
+					if (channelsock >= 0) {
+						checked_close(channelsock);
+					}
+					if (!config.vsock && channel_folder_fd >= 0) {
+						checked_close(channel_folder_fd);
+					}
+					if (cwd_fd >= 0) {
+						checked_close(cwd_fd);
+					}
+
+					int ssh_argc = 0;
+					while (arglist[ssh_argc] != NULL) {
+						ssh_argc++;
+					}
+
+					int rc = g_waypipe_ssh_inprocess_main_func(
+							ssh_argc, arglist,
+							g_waypipe_ssh_inprocess_main_user_data);
+					if (rc < 0 || rc > 255) {
+						rc = EXIT_FAILURE;
+					}
+					_exit(rc);
+				}
+				conn_pid = inprocess_pid;
+			} else {
+				int err = posix_spawnp(&conn_pid, arglist[0], NULL,
+						NULL, arglist, environ);
+				if (err) {
+					wp_error("Failed to spawn ssh process: %s",
+							strerror(err));
+					close(channelsock);
+					free(arglist);
+					return EXIT_FAILURE;
+				}
 			}
 
 			free(arglist);
+			if (conn_pid > 0) {
+				waypipe_register_owned_child_pid(
+						waypipe_get_current_owner_key(), conn_pid);
+			}
 		}
 
 		ret = run_client(cwd_fd, client_sock_path.folder,
@@ -1221,4 +1295,9 @@ int main(int argc, char **argv)
 	checked_close(cwd_fd);
 	check_unclosed_fds();
 	return ret;
+}
+
+int main(int argc, char **argv)
+{
+	return waypipe_main(argc, argv);
 }

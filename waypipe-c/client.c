@@ -37,6 +37,52 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+static inline bool owner_shutdown_requested_here(void)
+{
+	return waypipe_owner_shutdown_requested_current_thread();
+}
+
+static inline bool shutdown_requested_here(void)
+{
+	return shutdown_flag || owner_shutdown_requested_here();
+}
+
+static int wait_status_to_exit_code(int status, const char *label)
+{
+	if (WIFEXITED(status)) {
+		int code = WEXITSTATUS(status);
+		wp_error("%s exited with status %d", label ? label : "Child", code);
+		return code;
+	}
+
+	if (WIFSIGNALED(status)) {
+		int sig = WTERMSIG(status);
+		wp_error("%s terminated by signal %d", label ? label : "Child", sig);
+		return 128 + sig;
+	}
+
+	if (WIFSTOPPED(status)) {
+		int sig = WSTOPSIG(status);
+		wp_error("%s stopped by signal %d", label ? label : "Child", sig);
+		return EXIT_FAILURE;
+	}
+
+	wp_error("%s ended with unrecognized wait status=0x%x", label ? label : "Child", status);
+	return EXIT_FAILURE;
+}
+
+static void quiet_close_fd(int *fd)
+{
+	if (!fd || *fd < 0) {
+		return;
+	}
+	if (close(*fd) == -1 && errno != EBADF) {
+		wp_debug("close(%d) failed in worker cleanup: %s", *fd,
+				strerror(errno));
+	}
+	*fd = -1;
+}
+
 static int check_conn_header(uint32_t header, const struct main_config *config,
 		char *err, size_t err_size)
 {
@@ -236,6 +282,10 @@ static int run_single_client_reconnector(
 {
 	int retcode = EXIT_SUCCESS;
 	while (!shutdown_flag) {
+		if (owner_shutdown_requested_here()) {
+			break;
+		}
+
 		struct pollfd pf[2];
 		pf[0].fd = channelsock;
 		pf[0].events = POLLIN;
@@ -244,7 +294,7 @@ static int run_single_client_reconnector(
 		pf[1].events = 0;
 		pf[1].revents = 0;
 
-		int r = poll(pf, 2, -1);
+		int r = poll(pf, 2, waypipe_poll_timeout_ms(-1));
 		if (r == -1 && errno == EINTR) {
 			continue;
 		} else if (r == -1) {
@@ -322,14 +372,13 @@ static int run_single_client(int channelsock, pid_t *eol_pid,
 	int chanclient = -1;
 	struct connection_token conn_id;
 	memset(&conn_id, 0, sizeof(conn_id));
-	while (!shutdown_flag) {
+	while (!shutdown_requested_here()) {
 		int status = -1;
 		if (wait_for_pid_and_clean(eol_pid, &status, WNOHANG, NULL)) {
 			eol_pid = 0; // < in case eol_pid is recycled
 
 			wp_debug("Child (ssh) died, exiting");
-			// Copy the exit code
-			retcode = WEXITSTATUS(status);
+			retcode = wait_status_to_exit_code(status, "Child (ssh)");
 			break;
 		}
 
@@ -337,7 +386,7 @@ static int run_single_client(int channelsock, pid_t *eol_pid,
 		cs.fd = channelsock;
 		cs.events = POLLIN;
 		cs.revents = 0;
-		int r = poll(&cs, 1, -1);
+		int r = poll(&cs, 1, waypipe_poll_timeout_ms(-1));
 		if (r == -1) {
 			if (errno == EINTR) {
 				// If SIGCHLD, we will check the child.
@@ -389,7 +438,7 @@ static int run_single_client(int channelsock, pid_t *eol_pid,
 		chanclient = -1;
 		break;
 	}
-	if (retcode == EXIT_FAILURE || shutdown_flag || chanclient == -1) {
+	if (retcode == EXIT_FAILURE || shutdown_requested_here() || chanclient == -1) {
 		checked_close(channelsock);
 		checked_close(disp_fd);
 		return retcode;
@@ -446,10 +495,61 @@ void send_new_connection_fd(
 					-1) {
 				wp_error("Failed to send new connection fd to subprocess: %s",
 						strerror(errno));
+				checked_close(connmap->data[i].linkfd);
+				if (i != connmap->count - 1) {
+					memmove(&connmap->data[i], &connmap->data[i + 1],
+							sizeof(struct conn_addr) *
+									(size_t)(connmap->count - i - 1));
+				}
+				connmap->count--;
 			}
 			break;
 		}
 	}
+}
+
+struct client_connection_thread_ctx {
+	int cwd_fd;
+	int chanclient;
+	int linkfd;
+	char *display_folder;
+	struct sockaddr_un display_filename;
+	struct main_config config;
+};
+
+static void *run_client_connection_thread(void *arg)
+{
+	struct client_connection_thread_ctx *ctx =
+			(struct client_connection_thread_ctx *)arg;
+	if (!ctx) {
+		return NULL;
+	}
+
+	struct socket_path display_path = {
+			.folder = ctx->display_folder,
+			.filename = &ctx->display_filename,
+	};
+
+	int display_fd = -1;
+	if (connect_to_socket(ctx->cwd_fd, display_path, NULL, &display_fd) ==
+			-1) {
+		quiet_close_fd(&ctx->chanclient);
+		quiet_close_fd(&ctx->linkfd);
+		free(ctx->display_folder);
+		free(ctx);
+		return NULL;
+	}
+
+	(void)main_interface_loop(ctx->chanclient, display_fd, ctx->linkfd,
+			&ctx->config, true);
+
+	quiet_close_fd(&ctx->chanclient);
+	quiet_close_fd(&display_fd);
+	quiet_close_fd(&ctx->linkfd);
+
+	free(ctx->display_folder);
+	free(ctx);
+	return NULL;
 }
 
 static void handle_new_client_connection(int cwd_fd, struct pollfd *other_fds,
@@ -459,6 +559,7 @@ static void handle_new_client_connection(int cwd_fd, struct pollfd *other_fds,
 		const struct connection_token *conn_id)
 {
 	bool reconnectable = conn_id->header & CONN_RECONNECTABLE_BIT;
+	bool embedded_no_fork = waypipe_get_embedded_no_fork_mode();
 
 	if (reconnectable && buf_ensure_size(connmap->count + 1,
 					     sizeof(struct conn_addr),
@@ -475,6 +576,82 @@ static void handle_new_client_connection(int cwd_fd, struct pollfd *other_fds,
 			goto fail_cc;
 		}
 	}
+
+	if (embedded_no_fork) {
+		struct client_connection_thread_ctx *ctx =
+				calloc(1, sizeof(*ctx));
+		if (!ctx) {
+			wp_error("Failed to allocate connection worker thread context");
+			goto fail_ps;
+		}
+
+		ctx->display_folder = strdup(disp_path.folder ? disp_path.folder : "");
+		if (!ctx->display_folder) {
+			wp_error("Failed to duplicate display folder path for worker thread");
+			free(ctx);
+			goto fail_ps;
+		}
+
+		ctx->cwd_fd = cwd_fd;
+		/* Transfer ownership of the accepted fd directly to the worker.
+		 * In embedded/no-fork mode this avoids any risk of closing the
+		 * channel in the poll-loop teardown path before the worker starts. */
+		ctx->chanclient = chanclient;
+		ctx->linkfd = reconnectable ? linkfds[1] : -1;
+		ctx->display_filename = *disp_path.filename;
+		ctx->config = *config;
+		apply_conn_header(conn_id->header, &ctx->config);
+
+		pthread_attr_t attr;
+		if (pthread_attr_init(&attr) != 0) {
+			wp_error("Failed to initialize worker thread attributes");
+			quiet_close_fd(&ctx->linkfd);
+			free(ctx->display_folder);
+			free(ctx);
+			goto fail_ps;
+		}
+		if (pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED) !=
+				0) {
+			wp_error("Failed to configure detached worker thread");
+			pthread_attr_destroy(&attr);
+			quiet_close_fd(&ctx->linkfd);
+			free(ctx->display_folder);
+			free(ctx);
+			goto fail_ps;
+		}
+
+		pthread_t worker;
+		if (pthread_create(&worker, &attr, run_client_connection_thread,
+					ctx) != 0) {
+			wp_error("Failed to create worker thread for new client connection");
+			pthread_attr_destroy(&attr);
+			quiet_close_fd(&ctx->linkfd);
+			free(ctx->display_folder);
+			free(ctx);
+			goto fail_ps;
+		}
+		pthread_attr_destroy(&attr);
+
+		if (reconnectable) {
+			connmap->data[connmap->count++] =
+					(struct conn_addr){.linkfd = linkfds[0],
+							.token = *conn_id,
+							.pid = 0};
+		}
+
+		/* drop_incoming_connection() will remove this entry from the
+		 * poll arrays. Mark it as invalid now so the caller does not close
+		 * the fd we just handed to the worker thread. */
+		for (int i = 0; i < n_other_fds; i++) {
+			if (other_fds[i].fd == chanclient) {
+				other_fds[i].fd = -1;
+				break;
+			}
+		}
+
+		return;
+	}
+
 	pid_t npid = fork();
 	if (npid == 0) {
 		// Run forked process, with the only shared
@@ -520,9 +697,10 @@ static void handle_new_client_connection(int cwd_fd, struct pollfd *other_fds,
 
 	return;
 fail_ps:
-	checked_close(linkfds[0]);
+	quiet_close_fd(&linkfds[0]);
+	quiet_close_fd(&linkfds[1]);
 fail_cc:
-	checked_close(chanclient);
+	quiet_close_fd(&chanclient);
 	return;
 }
 #define NUM_INCOMPLETE_CONNECTIONS 63
@@ -531,7 +709,9 @@ static void drop_incoming_connection(struct pollfd *fds,
 		struct connection_token *tokens, uint8_t *bytes_read, int index,
 		int incomplete)
 {
-	checked_close(fds[index].fd);
+	if (fds[index].fd >= 0) {
+		checked_close(fds[index].fd);
+	}
 	if (index != incomplete - 1) {
 		size_t shift = (size_t)(incomplete - 1 - index);
 		memmove(fds + index, fds + index + 1,
@@ -567,17 +747,17 @@ static int run_multi_client(int cwd_fd, int channelsock, pid_t *eol_pid,
 	fds[0].revents = 0;
 
 	int retcode = EXIT_SUCCESS;
-	while (!shutdown_flag) {
+	while (!shutdown_requested_here()) {
 		int status = -1;
 		if (wait_for_pid_and_clean(
 				    eol_pid, &status, WNOHANG, &connmap)) {
 			wp_debug("Child (ssh) died, exiting");
-			// Copy the exit code
-			retcode = WEXITSTATUS(status);
+			retcode = wait_status_to_exit_code(status, "Child (ssh)");
 			break;
 		}
 
-		int r = poll(fds, 1 + (nfds_t)incomplete, -1);
+		int r = poll(fds, 1 + (nfds_t)incomplete,
+				waypipe_poll_timeout_ms(-1));
 		if (r == -1) {
 			if (errno == EINTR) {
 				// If SIGCHLD, we will check the child.
@@ -720,6 +900,7 @@ int run_client(int cwd_fd, const char *sock_folder_name, int sock_folder_fd,
 	 * function here, because its errors aren't immediately useful,
 	 * and older Wayland versions have edge cases */
 	int dispfd = -1;
+	uint64_t owner_key = waypipe_get_current_owner_key();
 	struct sockaddr_un display_filename = {0};
 	char display_folder[256] = {0};
 
@@ -774,19 +955,37 @@ int run_client(int cwd_fd, const char *sock_folder_name, int sock_folder_fd,
 		unlink_at_folder(cwd_fd, sock_folder_fd, sock_folder_name,
 				sock_filename);
 	}
-	int cleanup_type = shutdown_flag ? WNOHANG : 0;
-
 	int status = -1;
+	bool child_exited = false;
+	bool shutdown_requested = shutdown_requested_here();
+	if (shutdown_requested) {
+		child_exited = wait_for_child_process_exit(&eol_pid, &status, 1500, NULL,
+					"client ssh/process");
+		if (!child_exited) {
+			force_terminate_child_process(&eol_pid, "client ssh/process");
+		}
+	}
+
+	int cleanup_type = shutdown_requested ? WNOHANG : 0;
+
 	// Don't return until all child processes complete
-	if (wait_for_pid_and_clean(&eol_pid, &status, cleanup_type, NULL)) {
-		retcode = WEXITSTATUS(status);
+	if (child_exited ||
+			wait_for_pid_and_clean(&eol_pid, &status, cleanup_type, NULL)) {
+		retcode = wait_status_to_exit_code(status, "Child (ssh/process)");
+	}
+
+	if (owner_key != 0) {
+		waypipe_clear_owner_shutdown(owner_key);
 	}
 	return retcode;
 
 fail:
 	close(channelsock);
-	if (eol_pid) {
-		waitpid(eol_pid, NULL, 0);
+	if (owner_key != 0) {
+		waypipe_clear_owner_shutdown(owner_key);
+	}
+	if (eol_pid > 0) {
+		force_terminate_child_process(&eol_pid, "client startup failure");
 	}
 	if (!config->vsock) {
 		unlink_at_folder(cwd_fd, sock_folder_fd, sock_folder_name,

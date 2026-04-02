@@ -132,7 +132,7 @@ static int run_single_server_reconnector(int cwd_fd, int control_pipe,
 		pf[1].events = 0;
 		pf[1].revents = 0;
 
-		int r = poll(pf, 2, -1);
+		int r = poll(pf, 2, waypipe_poll_timeout_ms(-1));
 		if (r == -1 && errno == EINTR) {
 			continue;
 		} else if (r == -1) {
@@ -434,7 +434,8 @@ static int run_multi_server(int cwd_fd, int control_pipe,
 			break;
 		}
 
-		int r = poll(pfs, 1 + (control_pipe != -1), -1);
+		int r = poll(pfs, 1 + (control_pipe != -1),
+				waypipe_poll_timeout_ms(-1));
 		if (r == -1) {
 			if (errno == EINTR) {
 				// If SIGCHLD, we will check the child.
@@ -780,7 +781,15 @@ int run_server(int cwd_fd, struct socket_path socket_path,
 	wp_debug("Waiting for child handlers and program");
 
 	int status = -1;
-	if (wait_for_pid_and_clean(
+	bool child_exited = false;
+	if (shutdown_flag) {
+		child_exited = wait_for_child_process_exit(&pid, &status, 1500, NULL,
+					"server child program");
+		if (!child_exited) {
+			force_terminate_child_process(&pid, "server child program");
+		}
+	}
+	if (child_exited || wait_for_pid_and_clean(
 			    &pid, &status, shutdown_flag ? WNOHANG : 0, NULL)) {
 		wp_debug("Child program has died, exiting");
 		retcode = WEXITSTATUS(status);

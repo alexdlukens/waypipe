@@ -29,6 +29,7 @@
 #include <fcntl.h>
 #include <inttypes.h>
 #include <poll.h>
+#include <signal.h>
 #include <stdarg.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -172,8 +173,264 @@ bool is_utf8(const char *str)
 	return true;
 }
 
-bool shutdown_flag = false;
+volatile sig_atomic_t shutdown_flag = 0;
 uint64_t inherited_fds[4] = {0, 0, 0, 0};
+waypipe_log_sink_func_t waypipe_log_sink = NULL;
+static volatile sig_atomic_t g_waypipe_embedded_no_fork_mode = 0;
+static pthread_mutex_t g_waypipe_owner_shutdown_lock = PTHREAD_MUTEX_INITIALIZER;
+static uint64_t *g_waypipe_owner_shutdown_keys = NULL;
+static int g_waypipe_owner_shutdown_count = 0;
+static int g_waypipe_owner_shutdown_cap = 0;
+
+struct waypipe_owned_child_entry {
+	uint64_t owner_key;
+	pid_t pid;
+};
+
+static pthread_mutex_t g_waypipe_owned_children_lock = PTHREAD_MUTEX_INITIALIZER;
+static struct waypipe_owned_child_entry *g_waypipe_owned_children = NULL;
+static int g_waypipe_owned_children_count = 0;
+static int g_waypipe_owned_children_cap = 0;
+
+static uint64_t thread_owner_key_from_pthread(pthread_t tid)
+{
+	uint64_t key = 0;
+	size_t copy_len = sizeof(key) < sizeof(tid) ? sizeof(key) : sizeof(tid);
+	memcpy(&key, &tid, copy_len);
+	return key;
+}
+
+void waypipe_set_embedded_no_fork_mode(bool enabled)
+{
+	g_waypipe_embedded_no_fork_mode = enabled ? 1 : 0;
+}
+
+bool waypipe_get_embedded_no_fork_mode(void)
+{
+	return g_waypipe_embedded_no_fork_mode != 0;
+}
+
+int waypipe_poll_timeout_ms(int requested_timeout_ms)
+{
+	if (requested_timeout_ms >= 0) {
+		return requested_timeout_ms;
+	}
+
+	if (waypipe_get_embedded_no_fork_mode()) {
+		/* In embedded mode, do not block forever so loops can re-check
+		 * shutdown_flag and teardown state in bounded time. */
+		return 50;
+	}
+
+	return requested_timeout_ms;
+}
+
+uint64_t waypipe_get_current_owner_key(void)
+{
+	return thread_owner_key_from_pthread(pthread_self());
+}
+
+void waypipe_request_owner_shutdown(uint64_t owner_key)
+{
+	if (owner_key == 0) {
+		return;
+	}
+
+	pthread_mutex_lock(&g_waypipe_owner_shutdown_lock);
+	for (int i = 0; i < g_waypipe_owner_shutdown_count; i++) {
+		if (g_waypipe_owner_shutdown_keys[i] == owner_key) {
+			pthread_mutex_unlock(&g_waypipe_owner_shutdown_lock);
+			return;
+		}
+	}
+
+	if (g_waypipe_owner_shutdown_count >= g_waypipe_owner_shutdown_cap) {
+		int new_cap = g_waypipe_owner_shutdown_cap > 0 ?
+				g_waypipe_owner_shutdown_cap * 2 :
+				8;
+		uint64_t *new_buf = realloc(g_waypipe_owner_shutdown_keys,
+				sizeof(uint64_t) * (size_t)new_cap);
+		if (!new_buf) {
+			pthread_mutex_unlock(&g_waypipe_owner_shutdown_lock);
+			return;
+		}
+		g_waypipe_owner_shutdown_keys = new_buf;
+		g_waypipe_owner_shutdown_cap = new_cap;
+	}
+
+	g_waypipe_owner_shutdown_keys[g_waypipe_owner_shutdown_count++] = owner_key;
+	pthread_mutex_unlock(&g_waypipe_owner_shutdown_lock);
+}
+
+void waypipe_clear_owner_shutdown(uint64_t owner_key)
+{
+	if (owner_key == 0) {
+		return;
+	}
+
+	pthread_mutex_lock(&g_waypipe_owner_shutdown_lock);
+	for (int i = 0; i < g_waypipe_owner_shutdown_count; i++) {
+		if (g_waypipe_owner_shutdown_keys[i] != owner_key) {
+			continue;
+		}
+
+		if (i != g_waypipe_owner_shutdown_count - 1) {
+			memmove(&g_waypipe_owner_shutdown_keys[i],
+					&g_waypipe_owner_shutdown_keys[i + 1],
+					sizeof(uint64_t) * (size_t)(g_waypipe_owner_shutdown_count - i - 1));
+		}
+		g_waypipe_owner_shutdown_count--;
+		break;
+	}
+	pthread_mutex_unlock(&g_waypipe_owner_shutdown_lock);
+}
+
+bool waypipe_owner_shutdown_requested(uint64_t owner_key)
+{
+	if (owner_key == 0) {
+		return false;
+	}
+
+	bool requested = false;
+	pthread_mutex_lock(&g_waypipe_owner_shutdown_lock);
+	for (int i = 0; i < g_waypipe_owner_shutdown_count; i++) {
+		if (g_waypipe_owner_shutdown_keys[i] == owner_key) {
+			requested = true;
+			break;
+		}
+	}
+	pthread_mutex_unlock(&g_waypipe_owner_shutdown_lock);
+	return requested;
+}
+
+bool waypipe_owner_shutdown_requested_current_thread(void)
+{
+	return waypipe_owner_shutdown_requested(waypipe_get_current_owner_key());
+}
+
+void waypipe_register_owned_child_pid(uint64_t owner_key, pid_t pid)
+{
+	if (owner_key == 0 || pid <= 0) {
+		return;
+	}
+
+	pthread_mutex_lock(&g_waypipe_owned_children_lock);
+	for (int i = 0; i < g_waypipe_owned_children_count; i++) {
+		if (g_waypipe_owned_children[i].pid == pid) {
+			g_waypipe_owned_children[i].owner_key = owner_key;
+			pthread_mutex_unlock(&g_waypipe_owned_children_lock);
+			return;
+		}
+	}
+
+	if (g_waypipe_owned_children_count >= g_waypipe_owned_children_cap) {
+		int new_cap = g_waypipe_owned_children_cap > 0 ?
+				g_waypipe_owned_children_cap * 2 :
+				8;
+		struct waypipe_owned_child_entry *new_buf = realloc(
+				g_waypipe_owned_children,
+				sizeof(struct waypipe_owned_child_entry) * (size_t)new_cap);
+		if (!new_buf) {
+			pthread_mutex_unlock(&g_waypipe_owned_children_lock);
+			return;
+		}
+		g_waypipe_owned_children = new_buf;
+		g_waypipe_owned_children_cap = new_cap;
+	}
+
+	g_waypipe_owned_children[g_waypipe_owned_children_count++] =
+			(struct waypipe_owned_child_entry){
+					.owner_key = owner_key,
+					.pid = pid,
+			};
+	pthread_mutex_unlock(&g_waypipe_owned_children_lock);
+}
+
+void waypipe_unregister_owned_child_pid(pid_t pid)
+{
+	if (pid <= 0) {
+		return;
+	}
+
+	pthread_mutex_lock(&g_waypipe_owned_children_lock);
+	for (int i = 0; i < g_waypipe_owned_children_count; i++) {
+		if (g_waypipe_owned_children[i].pid != pid) {
+			continue;
+		}
+
+		if (i != g_waypipe_owned_children_count - 1) {
+			memmove(&g_waypipe_owned_children[i],
+					&g_waypipe_owned_children[i + 1],
+					sizeof(struct waypipe_owned_child_entry) *
+							(size_t)(g_waypipe_owned_children_count - i - 1));
+		}
+		g_waypipe_owned_children_count--;
+		break;
+	}
+	pthread_mutex_unlock(&g_waypipe_owned_children_lock);
+}
+
+void waypipe_force_terminate_owned_children(uint64_t owner_key)
+{
+	if (owner_key == 0) {
+		return;
+	}
+
+	pid_t pids[64];
+	int pid_count = 0;
+
+	pthread_mutex_lock(&g_waypipe_owned_children_lock);
+	for (int i = 0; i < g_waypipe_owned_children_count; i++) {
+		if (g_waypipe_owned_children[i].owner_key != owner_key) {
+			continue;
+		}
+		if (pid_count < (int)(sizeof(pids) / sizeof(pids[0]))) {
+			pids[pid_count++] = g_waypipe_owned_children[i].pid;
+		}
+	}
+	pthread_mutex_unlock(&g_waypipe_owned_children_lock);
+
+	for (int i = 0; i < pid_count; i++) {
+		pid_t pid = pids[i];
+		if (pid <= 0) {
+			continue;
+		}
+
+		if (kill(pid, SIGTERM) == -1 && errno != ESRCH) {
+			wp_debug("Owner shutdown SIGTERM failed for pid=%d owner=%" PRIu64 ": %s",
+					(int)pid, owner_key, strerror(errno));
+		}
+
+		int status = 0;
+		pid_t r = 0;
+		for (int k = 0; k < 10; k++) {
+			do {
+				r = waitpid(pid, &status, WNOHANG);
+			} while (r == -1 && errno == EINTR);
+
+			if (r == pid || (r == -1 && errno == ECHILD)) {
+				break;
+			}
+
+			struct timespec delay = {.tv_sec = 0, .tv_nsec = 50 * 1000 * 1000};
+			nanosleep(&delay, NULL);
+		}
+
+		if (r != pid && !(r == -1 && errno == ECHILD)) {
+			if (kill(pid, SIGKILL) == -1 && errno != ESRCH) {
+				wp_debug("Owner shutdown SIGKILL failed for pid=%d owner=%" PRIu64 ": %s",
+						(int)pid, owner_key, strerror(errno));
+			}
+
+			do {
+				r = waitpid(pid, &status, 0);
+			} while (r == -1 && errno == EINTR);
+		}
+
+		waypipe_unregister_owned_child_pid(pid);
+	}
+}
+
 void handle_sigint(int sig)
 {
 	(void)sig;
@@ -538,6 +795,45 @@ int send_one_fd(int socket, int fd)
 bool wait_for_pid_and_clean(pid_t *target_pid, int *status, int options,
 		struct conn_map *map)
 {
+	/*
+	 * In embedded/no-fork mode, multiple waypipe sessions can run concurrently
+	 * in the same host process. Using waitpid(-1, ...) here lets one session
+	 * reap another session's child, which can make active sessions terminate
+	 * unexpectedly.
+	 *
+	 * Scope reaping to the session's own child pid whenever we don't need to
+	 * reap a shared child pool.
+	 */
+	if (target_pid && *target_pid > 0 &&
+			(map == NULL || waypipe_get_embedded_no_fork_mode())) {
+		int stat = 0;
+		pid_t r;
+		do {
+			r = waitpid(*target_pid, &stat, options);
+		} while (r == -1 && errno == EINTR);
+
+		if (r == 0) {
+			return false;
+		}
+		if (r == -1) {
+			if (errno == ECHILD) {
+				waypipe_unregister_owned_child_pid(*target_pid);
+				*target_pid = 0;
+				return false;
+			}
+			wp_error("waitpid(%d) failed: %s", (int)*target_pid,
+					strerror(errno));
+			return false;
+		}
+
+		if (status) {
+			*status = stat;
+		}
+		waypipe_unregister_owned_child_pid(*target_pid);
+		*target_pid = 0;
+		return true;
+	}
+
 	bool found = false;
 	while (1) {
 		int stat;
@@ -553,6 +849,7 @@ bool wait_for_pid_and_clean(pid_t *target_pid, int *status, int options,
 		}
 
 		wp_debug("Child process %d has died", r);
+		waypipe_unregister_owned_child_pid(r);
 		if (map) {
 			/* Clean out all entries matching that pid */
 			int iw = 0;
@@ -573,6 +870,110 @@ bool wait_for_pid_and_clean(pid_t *target_pid, int *status, int options,
 			found = true;
 		}
 	}
+}
+
+bool wait_for_child_process_exit(pid_t *target_pid, int *status,
+		int timeout_ms, struct conn_map *map, const char *label)
+{
+	if (!target_pid || *target_pid <= 0) {
+		return false;
+	}
+
+	int local_status = 0;
+	if (!status) {
+		status = &local_status;
+	}
+
+	const int sleep_ms = 50;
+	int waited_ms = 0;
+	while (waited_ms <= timeout_ms) {
+		if (wait_for_pid_and_clean(target_pid, status, WNOHANG, map)) {
+			return true;
+		}
+		if (*target_pid <= 0) {
+			return true;
+		}
+		if (waited_ms >= timeout_ms) {
+			break;
+		}
+
+		struct timespec delay = {.tv_sec = 0, .tv_nsec = sleep_ms * 1000 * 1000};
+		nanosleep(&delay, NULL);
+		waited_ms += sleep_ms;
+	}
+
+	wp_debug("Child process %d%s%s%s did not exit during %d ms grace period",
+			*target_pid, label ? " (" : "", label ? label : "",
+			label ? ")" : "", timeout_ms);
+	return false;
+}
+
+void force_terminate_child_process(pid_t *target_pid, const char *label)
+{
+	if (!target_pid || *target_pid <= 0) {
+		return;
+	}
+
+	pid_t pid = *target_pid;
+	int status = 0;
+	pid_t r = 0;
+
+	do {
+		r = waitpid(pid, &status, WNOHANG);
+	} while (r == -1 && errno == EINTR);
+
+	if (r == pid || (r == -1 && errno == ECHILD)) {
+		waypipe_unregister_owned_child_pid(pid);
+		*target_pid = 0;
+		return;
+	}
+
+	if (r == -1) {
+		wp_error("Failed to query child process %d%s%s%s before forced shutdown: %s",
+				pid, label ? " (" : "", label ? label : "",
+				label ? ")" : "", strerror(errno));
+		waypipe_unregister_owned_child_pid(pid);
+		*target_pid = 0;
+		return;
+	}
+
+	wp_debug("Forcing termination of child process %d%s%s%s", pid,
+			label ? " (" : "", label ? label : "",
+			label ? ")" : "");
+
+	if (kill(pid, SIGTERM) == -1 && errno != ESRCH) {
+		wp_error("Failed to send SIGTERM to child process %d: %s", pid,
+				strerror(errno));
+	}
+
+	bool exited = false;
+	for (int i = 0; i < 20; i++) {
+		do {
+			r = waitpid(pid, &status, WNOHANG);
+		} while (r == -1 && errno == EINTR);
+
+		if (r == pid || (r == -1 && errno == ECHILD)) {
+			exited = true;
+			break;
+		}
+
+		struct timespec delay = {.tv_sec = 0, .tv_nsec = 50 * 1000 * 1000};
+		nanosleep(&delay, NULL);
+	}
+
+	if (!exited) {
+		if (kill(pid, SIGKILL) == -1 && errno != ESRCH) {
+			wp_error("Failed to send SIGKILL to child process %d: %s", pid,
+					strerror(errno));
+		}
+
+		do {
+			r = waitpid(pid, &status, 0);
+		} while (r == -1 && errno == EINTR);
+	}
+
+	*target_pid = 0;
+	waypipe_unregister_owned_child_pid(pid);
 }
 
 int buf_ensure_size(int count, size_t obj_size, int *space, void **data)

@@ -962,17 +962,42 @@ void do_wl_surface_req_set_buffer_scale(struct context *ctx, int32_t scale)
 void do_wl_keyboard_evt_keymap(
 		struct context *ctx, uint32_t format, int fd, uint32_t size)
 {
+	if (format == WL_KEYBOARD_KEYMAP_FORMAT_NO_KEYMAP || size == 0) {
+		wp_error("Dropping wl_keyboard.keymap with format=%u size=%u fd=%d to avoid unstable fd translation",
+				format, size, fd);
+		if (fd >= 0) {
+			checked_close(fd);
+		}
+		ctx->drop_this_msg = true;
+		return;
+	}
+
 	size_t fdsz = 0;
 	enum fdcat fdtype = get_fd_type(fd, &fdsz);
 	if (fdtype == FDC_UNKNOWN) {
 		fdtype = FDC_FILE;
 		fdsz = (size_t)size;
 	}
-	if (fdtype != FDC_FILE || fdsz != size) {
+	/* Some Android stacks surface keymap fds as character devices (classified
+	 * as pipe-like by get_fd_type) while still advertising a valid keymap
+	 * byte size in the protocol event. Treat these as file-like shadows so
+	 * keymap transfer does not degrade into a transient FDC_PIPE message and
+	 * tear down the stream shortly after startup. */
+	if (fdtype == FDC_PIPE && size > 0) {
+		wp_error("keymap fd %d appeared pipe-like (type=%s,size=%zu); treating as file-like with advertised size=%u",
+				fd, fdcat_to_str(fdtype), fdsz, size);
+		fdtype = FDC_FILE;
+		fdsz = (size_t)size;
+	}
+
+	if (fdtype != FDC_FILE || fdsz < size) {
 		wp_error("keymap candidate fd %d was not file-like (type=%s), and with size=%zu did not match %u",
 				fd, fdcat_to_str(fdtype), fdsz, size);
 		return;
 	}
+
+	/* Keep keymap mapping bounded to the protocol-advertised payload size. */
+	fdsz = (size_t)size;
 
 	struct shadow_fd *sfd = translate_fd(&ctx->g->map, &ctx->g->render,
 			&ctx->g->threads, fd, FDC_FILE, fdsz, NULL, false);
