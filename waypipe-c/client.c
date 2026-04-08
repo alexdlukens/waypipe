@@ -83,6 +83,83 @@ static void quiet_close_fd(int *fd)
 	*fd = -1;
 }
 
+static bool try_read_inprocess_exit_code(int *fd, int *exit_code)
+{
+	if (!fd || *fd < 0) {
+		return false;
+	}
+
+	int code = EXIT_FAILURE;
+	ssize_t nr = read(*fd, &code, sizeof(code));
+	if (nr == (ssize_t)sizeof(code)) {
+		if (exit_code) {
+			*exit_code = code;
+		}
+		quiet_close_fd(fd);
+		return true;
+	}
+	if (nr == 0) {
+		if (exit_code) {
+			*exit_code = EXIT_FAILURE;
+		}
+		quiet_close_fd(fd);
+		return true;
+	}
+	if (nr < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)) {
+		return false;
+	}
+
+	if (nr < 0) {
+		wp_error("Failed to read in-process ssh runner exit code: %s",
+				strerror(errno));
+	} else {
+		wp_error("Short read while reading in-process ssh runner exit code: %zd bytes",
+				nr);
+	}
+
+	if (exit_code) {
+		*exit_code = EXIT_FAILURE;
+	}
+	quiet_close_fd(fd);
+	return true;
+}
+
+static bool wait_for_inprocess_exit_code(int *fd, int timeout_ms, int *exit_code)
+{
+	if (!fd || *fd < 0) {
+		return false;
+	}
+
+	if (try_read_inprocess_exit_code(fd, exit_code)) {
+		return true;
+	}
+
+	int remaining_ms = timeout_ms;
+	while (*fd >= 0 && remaining_ms > 0) {
+		struct pollfd pfd = {
+			.fd = *fd,
+			.events = POLLIN | POLLHUP | POLLERR,
+			.revents = 0,
+		};
+		int wait_ms = remaining_ms < 50 ? remaining_ms : 50;
+		int rc = poll(&pfd, 1, wait_ms);
+		if (rc < 0) {
+			if (errno == EINTR) {
+				continue;
+			}
+			wp_error("poll on in-process ssh runner exit pipe failed: %s",
+					strerror(errno));
+			break;
+		}
+		remaining_ms -= wait_ms;
+		if (try_read_inprocess_exit_code(fd, exit_code)) {
+			return true;
+		}
+	}
+
+	return try_read_inprocess_exit_code(fd, exit_code);
+}
+
 static int check_conn_header(uint32_t header, const struct main_config *config,
 		char *err, size_t err_size)
 {
@@ -890,6 +967,7 @@ static int run_multi_client(int cwd_fd, int channelsock, pid_t *eol_pid,
 int run_client(int cwd_fd, const char *sock_folder_name, int sock_folder_fd,
 		const char *sock_filename, const struct main_config *config,
 		bool oneshot, const char *wayland_socket, pid_t eol_pid,
+		int eol_status_fd,
 		int channelsock)
 {
 	wp_debug("I'm a client listening on '%s' / '%s'", sock_folder_name,
@@ -955,8 +1033,13 @@ int run_client(int cwd_fd, const char *sock_folder_name, int sock_folder_fd,
 		unlink_at_folder(cwd_fd, sock_folder_fd, sock_folder_name,
 				sock_filename);
 	}
+	if (retcode != EXIT_SUCCESS && eol_status_fd >= 0 && owner_key != 0) {
+		waypipe_request_owner_shutdown(owner_key);
+	}
 	int status = -1;
 	bool child_exited = false;
+	bool thread_exited = false;
+	int thread_exit_code = EXIT_FAILURE;
 	bool shutdown_requested = shutdown_requested_here();
 	if (shutdown_requested) {
 		child_exited = wait_for_child_process_exit(&eol_pid, &status, 1500, NULL,
@@ -964,6 +1047,8 @@ int run_client(int cwd_fd, const char *sock_folder_name, int sock_folder_fd,
 		if (!child_exited) {
 			force_terminate_child_process(&eol_pid, "client ssh/process");
 		}
+		thread_exited = wait_for_inprocess_exit_code(&eol_status_fd, 1500,
+				&thread_exit_code);
 	}
 
 	int cleanup_type = shutdown_requested ? WNOHANG : 0;
@@ -972,7 +1057,18 @@ int run_client(int cwd_fd, const char *sock_folder_name, int sock_folder_fd,
 	if (child_exited ||
 			wait_for_pid_and_clean(&eol_pid, &status, cleanup_type, NULL)) {
 		retcode = wait_status_to_exit_code(status, "Child (ssh/process)");
+	} else if (thread_exited ||
+			try_read_inprocess_exit_code(&eol_status_fd, &thread_exit_code)) {
+		if (thread_exit_code == EXIT_SUCCESS) {
+			wp_debug("In-process ssh runner exited with status %d",
+					thread_exit_code);
+		} else {
+			wp_error("In-process ssh runner exited with status %d",
+					thread_exit_code);
+		}
+		retcode = thread_exit_code;
 	}
+	quiet_close_fd(&eol_status_fd);
 
 	if (owner_key != 0) {
 		waypipe_clear_owner_shutdown(owner_key);
@@ -981,6 +1077,11 @@ int run_client(int cwd_fd, const char *sock_folder_name, int sock_folder_fd,
 
 fail:
 	close(channelsock);
+	if (eol_status_fd >= 0 && owner_key != 0) {
+		waypipe_request_owner_shutdown(owner_key);
+		(void)wait_for_inprocess_exit_code(&eol_status_fd, 1500, NULL);
+	}
+	quiet_close_fd(&eol_status_fd);
 	if (owner_key != 0) {
 		waypipe_clear_owner_shutdown(owner_key);
 	}

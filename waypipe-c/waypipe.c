@@ -527,6 +527,171 @@ void waypipe_set_ssh_inprocess_main_func(
 	g_waypipe_ssh_inprocess_main_user_data = p_user_data;
 }
 
+struct inprocess_ssh_thread_ctx {
+	waypipe_ssh_inprocess_main_func_t func;
+	void *user_data;
+	char **argv;
+	int argc;
+	int status_fd;
+	uint64_t owner_key;
+};
+
+static void free_inprocess_ssh_thread_argv(char **argv, int argc)
+{
+	if (!argv) {
+		return;
+	}
+	for (int i = 0; i < argc; i++) {
+		free(argv[i]);
+	}
+	free(argv);
+}
+
+static void free_inprocess_ssh_thread_ctx(struct inprocess_ssh_thread_ctx *ctx)
+{
+	if (!ctx) {
+		return;
+	}
+	if (ctx->status_fd >= 0) {
+		checked_close(ctx->status_fd);
+		ctx->status_fd = -1;
+	}
+	free_inprocess_ssh_thread_argv(ctx->argv, ctx->argc);
+	free(ctx);
+}
+
+static int duplicate_argv_for_inprocess_thread(char **src_argv, char ***dst_argv,
+		int *dst_argc)
+{
+	if (!src_argv || !dst_argv || !dst_argc) {
+		return -1;
+	}
+
+	int argc = 0;
+	while (src_argv[argc] != NULL) {
+		argc++;
+	}
+
+	char **copy = calloc((size_t)argc + 1, sizeof(char *));
+	if (!copy) {
+		return -1;
+	}
+
+	for (int i = 0; i < argc; i++) {
+		copy[i] = strdup(src_argv[i]);
+		if (!copy[i]) {
+			free_inprocess_ssh_thread_argv(copy, argc);
+			return -1;
+		}
+	}
+
+	copy[argc] = NULL;
+	*dst_argv = copy;
+	*dst_argc = argc;
+	return 0;
+}
+
+static void *run_inprocess_ssh_thread(void *data)
+{
+	struct inprocess_ssh_thread_ctx *ctx =
+			(struct inprocess_ssh_thread_ctx *)data;
+	if (!ctx) {
+		return NULL;
+	}
+
+	int exit_code = ctx->func ?
+			ctx->func(ctx->argc, ctx->argv, ctx->user_data) :
+			EXIT_FAILURE;
+	if (exit_code < 0 || exit_code > 255) {
+		exit_code = EXIT_FAILURE;
+	}
+
+	if (ctx->status_fd >= 0) {
+		(void)write(ctx->status_fd, &exit_code, sizeof(exit_code));
+		checked_close(ctx->status_fd);
+		ctx->status_fd = -1;
+	}
+
+	if (ctx->owner_key != 0) {
+		waypipe_request_owner_shutdown(ctx->owner_key);
+	}
+
+	free_inprocess_ssh_thread_ctx(ctx);
+	return NULL;
+}
+
+static int spawn_inprocess_ssh_thread(char **arglist, int *status_fd_out)
+{
+	if (!g_waypipe_ssh_inprocess_main_func || !arglist || !status_fd_out) {
+		return -1;
+	}
+
+	*status_fd_out = -1;
+
+	int pipe_fds[2] = {-1, -1};
+	if (pipe(pipe_fds) == -1) {
+		wp_error("Failed to create in-process ssh status pipe: %s",
+				strerror(errno));
+		return -1;
+	}
+	if (set_nonblocking(pipe_fds[0]) == -1 || set_cloexec(pipe_fds[0]) == -1 ||
+			set_cloexec(pipe_fds[1]) == -1) {
+		wp_error("Failed to configure in-process ssh status pipe");
+		checked_close(pipe_fds[0]);
+		checked_close(pipe_fds[1]);
+		return -1;
+	}
+
+	struct inprocess_ssh_thread_ctx *ctx =
+			calloc(1, sizeof(*ctx));
+	if (!ctx) {
+		wp_error("Failed to allocate in-process ssh thread context");
+		checked_close(pipe_fds[0]);
+		checked_close(pipe_fds[1]);
+		return -1;
+	}
+
+	ctx->func = g_waypipe_ssh_inprocess_main_func;
+	ctx->user_data = g_waypipe_ssh_inprocess_main_user_data;
+	ctx->status_fd = pipe_fds[1];
+	ctx->owner_key = waypipe_get_current_owner_key();
+	if (duplicate_argv_for_inprocess_thread(arglist, &ctx->argv, &ctx->argc) !=
+			0) {
+		wp_error("Failed to duplicate in-process ssh argv for worker thread");
+		checked_close(pipe_fds[0]);
+		free_inprocess_ssh_thread_ctx(ctx);
+		return -1;
+	}
+
+	pthread_attr_t attr;
+	if (pthread_attr_init(&attr) != 0) {
+		wp_error("Failed to initialize in-process ssh thread attributes");
+		checked_close(pipe_fds[0]);
+		free_inprocess_ssh_thread_ctx(ctx);
+		return -1;
+	}
+	if (pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED) != 0) {
+		wp_error("Failed to configure detached in-process ssh thread");
+		pthread_attr_destroy(&attr);
+		checked_close(pipe_fds[0]);
+		free_inprocess_ssh_thread_ctx(ctx);
+		return -1;
+	}
+
+	pthread_t worker;
+	if (pthread_create(&worker, &attr, run_inprocess_ssh_thread, ctx) != 0) {
+		wp_error("Failed to create in-process ssh worker thread");
+		pthread_attr_destroy(&attr);
+		checked_close(pipe_fds[0]);
+		free_inprocess_ssh_thread_ctx(ctx);
+		return -1;
+	}
+	pthread_attr_destroy(&attr);
+
+	*status_fd_out = pipe_fds[0];
+	return 0;
+}
+
 #ifdef HAS_SECURITY_CONTEXT
 int create_security_context(const char *sock_path, const char *engine,
 		const char *instance_id, const char *app_id);
@@ -951,7 +1116,7 @@ int waypipe_main(int argc, char **argv)
 			ret = run_client(cwd_fd, client_sock_path.folder,
 					client_folder_fd,
 					client_sock_path.filename->sun_path,
-					&config, oneshot, wayland_socket, 0,
+					&config, oneshot, wayland_socket, 0, -1,
 					channelsock);
 			if (!config.vsock) {
 				checked_close(client_folder_fd);
@@ -1088,7 +1253,8 @@ int waypipe_main(int argc, char **argv)
 #endif
 		}
 
-		pid_t conn_pid;
+		pid_t conn_pid = 0;
+		int conn_status_fd = -1;
 		{
 			char linkage[512];
 			char serversock[256];
@@ -1230,38 +1396,47 @@ int waypipe_main(int argc, char **argv)
 			}
 			arglist[argc + offset] = NULL;
 			if (g_waypipe_ssh_inprocess_main_func) {
-				pid_t inprocess_pid = fork();
-				if (inprocess_pid == -1) {
-					wp_error("Failed to fork in-process ssh runner: %s",
-							strerror(errno));
-					close(channelsock);
-					free(arglist);
-					return EXIT_FAILURE;
-				} else if (inprocess_pid == 0) {
-					if (channelsock >= 0) {
-						checked_close(channelsock);
+				if (waypipe_get_embedded_no_fork_mode()) {
+					if (spawn_inprocess_ssh_thread(arglist,
+							&conn_status_fd) != 0) {
+						close(channelsock);
+						free(arglist);
+						return EXIT_FAILURE;
 					}
-					if (!config.vsock && channel_folder_fd >= 0) {
-						checked_close(channel_folder_fd);
-					}
-					if (cwd_fd >= 0) {
-						checked_close(cwd_fd);
-					}
+				} else {
+					pid_t inprocess_pid = fork();
+					if (inprocess_pid == -1) {
+						wp_error("Failed to fork in-process ssh runner: %s",
+								strerror(errno));
+						close(channelsock);
+						free(arglist);
+						return EXIT_FAILURE;
+					} else if (inprocess_pid == 0) {
+						if (channelsock >= 0) {
+							checked_close(channelsock);
+						}
+						if (!config.vsock && channel_folder_fd >= 0) {
+							checked_close(channel_folder_fd);
+						}
+						if (cwd_fd >= 0) {
+							checked_close(cwd_fd);
+						}
 
-					int ssh_argc = 0;
-					while (arglist[ssh_argc] != NULL) {
-						ssh_argc++;
-					}
+						int ssh_argc = 0;
+						while (arglist[ssh_argc] != NULL) {
+							ssh_argc++;
+						}
 
-					int rc = g_waypipe_ssh_inprocess_main_func(
-							ssh_argc, arglist,
-							g_waypipe_ssh_inprocess_main_user_data);
-					if (rc < 0 || rc > 255) {
-						rc = EXIT_FAILURE;
+						int rc = g_waypipe_ssh_inprocess_main_func(
+								ssh_argc, arglist,
+								g_waypipe_ssh_inprocess_main_user_data);
+						if (rc < 0 || rc > 255) {
+							rc = EXIT_FAILURE;
+						}
+						_exit(rc);
 					}
-					_exit(rc);
+					conn_pid = inprocess_pid;
 				}
-				conn_pid = inprocess_pid;
 			} else {
 				int err = posix_spawnp(&conn_pid, arglist[0], NULL,
 						NULL, arglist, environ);
@@ -1284,7 +1459,8 @@ int waypipe_main(int argc, char **argv)
 		ret = run_client(cwd_fd, client_sock_path.folder,
 				channel_folder_fd,
 				client_sock_path.filename->sun_path, &config,
-				oneshot, wayland_socket, conn_pid, channelsock);
+				oneshot, wayland_socket, conn_pid, conn_status_fd,
+				channelsock);
 		if (!config.vsock) {
 			checked_close(channel_folder_fd);
 		}
