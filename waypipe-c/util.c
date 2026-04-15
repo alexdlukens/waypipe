@@ -697,7 +697,7 @@ void check_unclosed_fds(void)
 						  (1uLL << (i % 64))) != 0;
 		if (initial_fd) {
 			if (checklist[i].revents & POLLNVAL) {
-				wp_error("Unexpected closed fd %d", i);
+				wp_debug("Unexpected closed fd %d", i);
 			}
 		} else {
 			if (checklist[i].revents & POLLNVAL) {
