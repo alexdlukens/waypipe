@@ -1225,8 +1225,10 @@ int main_interface_loop(int chanfd, int progfd, int linkfd,
 
 	g.config = config;
 	g.render = (struct render_data){
+			.cpu_dmabuf_fallback = false,
 			.drm_node_path = config->drm_node,
 			.drm_fd = -1,
+#ifdef HAS_DMABUF
 			.dev = NULL,
 			.disabled = config->no_gpu,
 			.av_disabled = config->no_gpu ||
@@ -1237,6 +1239,9 @@ int main_interface_loop(int chanfd, int progfd, int linkfd,
 			.av_drmdevice_ref = NULL,
 			.av_vadisplay = NULL,
 			.av_copy_config = 0,
+#else
+			.disabled = config->no_gpu,
+#endif
 	};
 	if (setup_thread_pool(&g.threads, config->compression,
 			    config->compression_level,

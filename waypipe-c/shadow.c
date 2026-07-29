@@ -36,7 +36,7 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <unistd.h>
-#include "ahb.h"
+
 
 #ifdef HAS_LZ4
 #include <lz4.h>
@@ -655,6 +655,7 @@ struct shadow_fd *translate_fd(struct fd_translation_map *map,
 		}
 	} break;
 	case FDC_DMAVID_IR: {
+#ifdef HAS_DMABUF
 		sfd->video_fmt = render->av_video_fmt;
 
 		memcpy(&sfd->dmabuf_info, info,
@@ -669,8 +670,10 @@ struct shadow_fd *translate_fd(struct fd_translation_map *map,
 			wp_error("Video encoding setup failed for RID=%d",
 					sfd->remote_id);
 		}
+#endif
 	} break;
 	case FDC_DMAVID_IW: {
+#ifdef HAS_DMABUF
 		sfd->video_fmt = render->av_video_fmt;
 
 		memcpy(&sfd->dmabuf_info, info,
@@ -686,6 +689,7 @@ struct shadow_fd *translate_fd(struct fd_translation_map *map,
 			wp_error("Video decoding setup failed for RID=%d",
 					sfd->remote_id);
 		}
+#endif
 	} break;
 	case FDC_DMABUF: {
 		sfd->buffer_size = 0;
@@ -1291,27 +1295,14 @@ void collect_update(struct thread_pool *threads, struct shadow_fd *sfd,
 						PROT_READ, MAP_SHARED,
 						sfd->fd_local, 0);
 				if (sfd->mem_local == MAP_FAILED) {
-					// On Android, try AHardwareBuffer fallback
-#if defined(__ANDROID__)
-					if (ahb_readback_fallback(sfd) == 0) {
-						sfd->cpu_mapped = false;
-					} else {
-						wp_error("CPU dmabuf mmap + AHB fallback failed");
-						sfd->mem_local = NULL;
-						return;
-					}
-#else
 					wp_error("CPU dmabuf mmap failed: %s",
 							strerror(errno));
 					sfd->mem_local = NULL;
 					return;
-#endif
-				} else {
-					sfd->dmabuf_map_handle = NULL;
-					sfd->dmabuf_map_stride =
-						sfd->dmabuf_info.strides[0];
-					sfd->cpu_mapped = true;
 				}
+				sfd->dmabuf_map_handle = NULL;
+				sfd->dmabuf_map_stride =
+					sfd->dmabuf_info.strides[0];
 			}
 		} else {
 			// Existing GBM path
@@ -1341,14 +1332,17 @@ void collect_update(struct thread_pool *threads, struct shadow_fd *sfd,
 			}
 
 			sfd->remote_bufsize = 0;
-			queue_fill_transfers(threads, sfd, transfers);
-			sfd->remote_bufsize = sfd->buffer_size;
+			if (sfd->buffer_size > 0) {
+				// A new dmabuf, needs to be shared
+				add_dmabuf_create_request(
+						transfers, sfd,
+						WMSG_OPEN_DMABUF);
+			}
 		} else {
-			// TODO: detailed damage tracking
-			damage_everything(&sfd->damage);
+			// TODO: diff support? right now all dmabufs are
+			// transferred in full as updates, no diff.
 			queue_diff_transfers(threads, sfd, transfers);
 		}
-		/* Unmapping will be handled by finish_update() */
 	} break;
 	case FDC_DMAVID_IR: {
 		if (!sfd->is_dirty) {
