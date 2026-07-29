@@ -217,10 +217,15 @@ struct shadow_fd {
 	struct pipe_state pipe;
 
 	// DMAbuf data
+#ifdef HAS_DMABUF
 	struct gbm_bo *dmabuf_bo;
+#else
+	void *dmabuf_bo;       /* always NULL on Android; placeholder for compat */
+#endif
 	struct dmabuf_slice_data dmabuf_info;
 	void *dmabuf_map_handle; /* Nonnull when DMABUF is currently mapped */
 	uint32_t dmabuf_map_stride; /* stride at which mem_local is mapped */
+	bool cpu_mapped;        /* true if mem_local is direct mmap, not GBM */
 	/* temporary cache of stride-fixed mem_local. Same dimensions as
 	 * mem_mirror */
 	char *dmabuf_warped;

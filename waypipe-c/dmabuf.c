@@ -25,14 +25,17 @@
 
 #include "dmabuf.h"
 #include "util.h"
+#include <stddef.h>
 
 #ifndef HAS_DMABUF
 
 int init_render_data(struct render_data *data)
 {
-	data->disabled = true;
-	(void)data;
-	return -1;
+	data->disabled = false;
+	data->cpu_dmabuf_fallback = true;
+	data->drm_fd = -1;
+	data->drm_node_path = NULL;
+	return 0;
 }
 void cleanup_render_data(struct render_data *data) { (void)data; }
 struct gbm_bo *import_dmabuf(struct render_data *rd, int fd, size_t *size,

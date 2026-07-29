@@ -36,6 +36,7 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include "ahb.h"
 
 #ifdef HAS_LZ4
 #include <lz4.h>
@@ -86,10 +87,17 @@ static void destroy_unlinked_sfd(struct shadow_fd *sfd)
 		zeroed_aligned_free(sfd->mem_mirror, &sfd->mem_mirror_handle);
 	} else if (sfd->type == FDC_DMABUF || sfd->type == FDC_DMAVID_IR ||
 			sfd->type == FDC_DMAVID_IW) {
-		if (sfd->dmabuf_map_handle) {
+		if (sfd->cpu_mapped) {
+			if (sfd->mem_local) {
+				munmap(sfd->mem_local, sfd->buffer_size);
+				sfd->mem_local = NULL;
+			}
+		} else if (sfd->dmabuf_map_handle) {
 			unmap_dmabuf(sfd->dmabuf_bo, sfd->dmabuf_map_handle);
 		}
-		destroy_dmabuf(sfd->dmabuf_bo);
+		if (sfd->dmabuf_bo) {
+			destroy_dmabuf(sfd->dmabuf_bo);
+		}
 		zeroed_aligned_free(sfd->mem_mirror, &sfd->mem_mirror_handle);
 		if (sfd->dmabuf_warped_handle) {
 			zeroed_aligned_free(sfd->dmabuf_warped,
@@ -682,16 +690,34 @@ struct shadow_fd *translate_fd(struct fd_translation_map *map,
 	case FDC_DMABUF: {
 		sfd->buffer_size = 0;
 
-		init_render_data(render);
-		memcpy(&sfd->dmabuf_info, info,
-				sizeof(struct dmabuf_slice_data));
-		sfd->dmabuf_bo = import_dmabuf(render, sfd->fd_local,
-				&sfd->buffer_size, &sfd->dmabuf_info);
-		if (!sfd->dmabuf_bo) {
-			return sfd;
+		if (render->cpu_dmabuf_fallback) {
+			// CPU fallback: don't use GBM import.
+			memcpy(&sfd->dmabuf_info, info,
+					sizeof(struct dmabuf_slice_data));
+			sfd->cpu_mapped = true;
+			// Compute buffer_size from dimensions or fd size
+			int bpp = get_shm_bytes_per_pixel(info->format);
+			if (bpp > 0) {
+				sfd->buffer_size = (size_t)info->height *
+						(size_t)info->strides[0];
+			} else {
+				sfd->buffer_size = (size_t)lseek(
+						sfd->fd_local, 0, SEEK_END);
+				lseek(sfd->fd_local, 0, SEEK_SET);
+			}
+			sfd->mem_mirror = NULL;
+		} else {
+			// Existing GBM path
+			init_render_data(render);
+			memcpy(&sfd->dmabuf_info, info,
+					sizeof(struct dmabuf_slice_data));
+			sfd->dmabuf_bo = import_dmabuf(render, sfd->fd_local,
+					&sfd->buffer_size, &sfd->dmabuf_info);
+			if (!sfd->dmabuf_bo) {
+				return sfd;
+			}
+			sfd->mem_mirror = NULL;
 		}
-		// to be created on first transfer
-		sfd->mem_mirror = NULL;
 	} break;
 	case FDC_UNKNOWN:
 		wp_error("Trying to create shadow_fd for unknown filedesc type");
@@ -1258,16 +1284,47 @@ void collect_update(struct thread_pool *threads, struct shadow_fd *sfd,
 			add_dmabuf_create_request(
 					transfers, sfd, WMSG_OPEN_DMABUF);
 		}
-		if (!sfd->dmabuf_bo) {
-			// ^ was not previously able to create buffer
-			return;
-		}
-		if (!sfd->mem_local) {
-			sfd->mem_local = map_dmabuf(sfd->dmabuf_bo, false,
-					&sfd->dmabuf_map_handle,
-					&sfd->dmabuf_map_stride);
+		// CPU fallback path — works on Linux + Android
+		if (sfd->cpu_mapped) {
 			if (!sfd->mem_local) {
+				sfd->mem_local = mmap(NULL, sfd->buffer_size,
+						PROT_READ, MAP_SHARED,
+						sfd->fd_local, 0);
+				if (sfd->mem_local == MAP_FAILED) {
+					// On Android, try AHardwareBuffer fallback
+#if defined(__ANDROID__)
+					if (ahb_readback_fallback(sfd) == 0) {
+						sfd->cpu_mapped = false;
+					} else {
+						wp_error("CPU dmabuf mmap + AHB fallback failed");
+						sfd->mem_local = NULL;
+						return;
+					}
+#else
+					wp_error("CPU dmabuf mmap failed: %s",
+							strerror(errno));
+					sfd->mem_local = NULL;
+					return;
+#endif
+				} else {
+					sfd->dmabuf_map_handle = NULL;
+					sfd->dmabuf_map_stride =
+						sfd->dmabuf_info.strides[0];
+					sfd->cpu_mapped = true;
+				}
+			}
+		} else {
+			// Existing GBM path
+			if (!sfd->dmabuf_bo) {
 				return;
+			}
+			if (!sfd->mem_local) {
+				sfd->mem_local = map_dmabuf(sfd->dmabuf_bo, false,
+						&sfd->dmabuf_map_handle,
+						&sfd->dmabuf_map_stride);
+				if (!sfd->mem_local) {
+					return;
+				}
 			}
 		}
 		if (first) {

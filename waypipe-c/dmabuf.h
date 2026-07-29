@@ -35,8 +35,10 @@ typedef unsigned int VAGenericID;
 typedef VAGenericID VAConfigID;
 struct render_data {
 	bool disabled;
+	bool cpu_dmabuf_fallback;
 	int drm_fd;
 	const char *drm_node_path;
+#ifdef HAS_DMABUF
 	struct gbm_device *dev;
 	bool supports_modifiers;
 	/* video hardware context */
@@ -47,6 +49,7 @@ struct render_data {
 	struct AVBufferRef *av_drmdevice_ref;
 	VADisplay av_vadisplay;
 	VAConfigID av_copy_config;
+#endif
 };
 
 /** Additional information to help serialize a dmabuf */

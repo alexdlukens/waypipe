@@ -409,14 +409,16 @@ void do_wl_registry_evt_global(struct context *ctx, uint32_t name,
 	requires_rnode |= !strcmp(interface, "zwlr_export_dmabuf_manager_v1");
 	if (requires_rnode) {
 		if (init_render_data(&ctx->g->render) == -1) {
-			/* A gpu connection supported by waypipe is required on
-			 * both sides, since data transfers may occur in both
-			 * directions, and
-			 * modifying textures may require driver support */
-			wp_debug("Discarding protocol advertisement for %s, render node support disabled",
-					interface);
-			ctx->drop_this_msg = true;
-			return;
+			if (!strcmp(interface, "zwp_linux_dmabuf_v1") &&
+			    !ctx->on_display_side) {
+				// Application side: use CPU mmap fallback.
+				ctx->g->render.cpu_dmabuf_fallback = true;
+			} else {
+				wp_debug("Discarding protocol advertisement for %s, render node support disabled",
+						interface);
+				ctx->drop_this_msg = true;
+				return;
+			}
 		}
 	}
 
@@ -1319,6 +1321,11 @@ void do_wl_drm_req_create_prime_buffer(struct context *ctx,
 static bool dmabuf_format_permitted(
 		struct context *ctx, uint32_t format, uint64_t modifier)
 {
+	if (ctx->g->render.cpu_dmabuf_fallback) {
+		// CPU fallback: accept single-planar RGB formats only.
+		// We mmap regardless of modifier.
+		return get_shm_bytes_per_pixel(format) != -1;
+	}
 	if (ctx->g->config->only_linear_dmabuf) {
 		/* MOD_INVALID is allowed because some drivers don't support
 		 * LINEAR. Every modern GPU+driver should be able to handle
@@ -1348,7 +1355,6 @@ void do_zwp_linux_dmabuf_v1_evt_modifier(struct context *ctx, uint32_t format,
 		uint32_t modifier_hi, uint32_t modifier_lo)
 {
 
-	(void)format;
 	uint64_t modifier = modifier_hi * 0x100000000uLL + modifier_lo;
 	// Prevent all advertisements for dmabufs with modifiers
 	if (!dmabuf_format_permitted(ctx, format, modifier)) {
