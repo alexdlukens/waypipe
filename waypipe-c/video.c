@@ -735,7 +735,7 @@ static void configure_low_latency_enc_context(struct AVCodecContext *ctx,
 	ctx->delay = 0;
 
 	if (sw) {
-		ctx->bit_rate = bpf * nom_fps;
+		ctx->bit_rate = (int64_t)bpf * nom_fps;
 		if (fmt == VIDEO_H264) {
 			if (av_opt_set(ctx->priv_data, "preset", "ultrafast",
 					    0) != 0) {
@@ -775,7 +775,7 @@ static void configure_low_latency_enc_context(struct AVCodecContext *ctx,
 			ctx->thread_count = nthreads;
 		}
 	} else {
-		ctx->bit_rate = bpf * nom_fps;
+		ctx->bit_rate = (int64_t)bpf * nom_fps;
 		if (fmt == VIDEO_H264) {
 			/* with i965/gen8, hardware encoding is faster but has
 			 * significantly worse quality per bitrate than x264 */
@@ -993,7 +993,16 @@ int setup_video_encode(
 		return -1;
 	}
 
+	struct AVPacket *pkt = NULL;
+	struct AVFrame *local_frame = NULL;
+	struct AVFrame *yuv_frame = NULL;
+	struct SwsContext *sws = NULL;
+
 	struct AVCodecContext *ctx = avcodec_alloc_context3(codec);
+	if (!ctx) {
+		wp_error("Failed to allocate codec context");
+		return -1;
+	}
 	ctx->pix_fmt = videofmt;
 	configure_low_latency_enc_context(
 			ctx, true, sfd->video_fmt, rd->av_bpf, nthreads);
@@ -1005,17 +1014,21 @@ int setup_video_encode(
 	avcodec_align_dimensions2(
 			ctx, &ctx->width, &ctx->height, linesize_align);
 
-	struct AVPacket *pkt = av_packet_alloc();
+	pkt = av_packet_alloc();
+	if (!pkt) {
+		wp_error("Failed to allocate video packet");
+		goto cleanup;
+	}
 
 	if (avcodec_open2(ctx, codec, NULL) < 0) {
 		wp_error("Failed to open codec");
-		return -1;
+		goto cleanup;
 	}
 
-	struct AVFrame *local_frame = av_frame_alloc();
+	local_frame = av_frame_alloc();
 	if (!local_frame) {
 		wp_error("Could not allocate video frame");
-		return -1;
+		goto cleanup;
 	}
 	local_frame->format = avpixfmt;
 	/* adopt padded sizes */
@@ -1025,10 +1038,14 @@ int setup_video_encode(
 			    local_frame->width, local_frame->height, avpixfmt,
 			    64) < 0) {
 		wp_error("Failed to allocate temp image");
-		return -1;
+		goto cleanup;
 	}
 
-	struct AVFrame *yuv_frame = av_frame_alloc();
+	yuv_frame = av_frame_alloc();
+	if (!yuv_frame) {
+		wp_error("Could not allocate yuv frame");
+		goto cleanup;
+	}
 	yuv_frame->width = ctx->width;
 	yuv_frame->height = ctx->height;
 	yuv_frame->format = videofmt;
@@ -1036,15 +1053,15 @@ int setup_video_encode(
 			    yuv_frame->width, yuv_frame->height, videofmt,
 			    64) < 0) {
 		wp_error("Failed to allocate temp image");
-		return -1;
+		goto cleanup;
 	}
-	struct SwsContext *sws = sws_getContext(local_frame->width,
+	sws = sws_getContext(local_frame->width,
 			local_frame->height, avpixfmt, yuv_frame->width,
 			yuv_frame->height, videofmt, SWS_BILINEAR, NULL, NULL,
 			NULL);
 	if (!sws) {
 		wp_error("Could not create software color conversion context");
-		return -1;
+		goto cleanup;
 	}
 
 	sfd->video_yuv_frame = yuv_frame;
@@ -1056,6 +1073,20 @@ int setup_video_encode(
 	sfd->video_context = ctx;
 	sfd->video_color_context = sws;
 	return 0;
+
+cleanup:
+	avcodec_free_context(&ctx);
+	av_packet_free(&pkt);
+	if (local_frame) {
+		av_freep(&local_frame->data[0]);
+		av_frame_free(&local_frame);
+	}
+	if (yuv_frame) {
+		av_freep(&yuv_frame->data[0]);
+		av_frame_free(&yuv_frame);
+	}
+	sws_freeContext(sws);
+	return -1;
 }
 
 static enum AVPixelFormat get_decode_format(
@@ -1132,16 +1163,21 @@ int setup_video_decode(struct shadow_fd *sfd, struct render_data *rd)
 	}
 	if (avcodec_open2(ctx, codec, NULL) < 0) {
 		wp_error("Failed to open codec");
+		avcodec_free_context(&ctx);
+		return -1;
 	}
 
 	struct AVFrame *yuv_frame = av_frame_alloc();
 	if (!yuv_frame) {
 		wp_error("Could not allocate yuv frame");
+		avcodec_free_context(&ctx);
 		return -1;
 	}
 	struct AVPacket *pkt = av_packet_alloc();
 	if (!pkt) {
 		wp_error("Could not allocate video packet");
+		av_frame_free(&yuv_frame);
+		avcodec_free_context(&ctx);
 		return -1;
 	}
 
@@ -1170,16 +1206,54 @@ void collect_video_from_mirror(
 {
 	if (sfd->video_color_context) {
 		/* If using software encoding, need to convert to YUV */
-		void *handle = NULL;
+		const char *data = NULL;
 		uint32_t map_stride = 0;
-		void *data = map_dmabuf(
-				sfd->dmabuf_bo, false, &handle, &map_stride);
-		if (!data) {
-			return;
+		void *handle = NULL;
+		if (sfd->cpu_mapped) {
+			/* CPU fallback: the buffer is a plain mmap, not a
+			 * GBM bo; feed the encoder from the mapped pixels. */
+			if (!sfd->mem_local) {
+				return;
+			}
+			data = sfd->mem_local;
+			map_stride = sfd->dmabuf_map_stride;
+			if (map_stride != sfd->dmabuf_info.strides[0]) {
+				/* The mmap stride differs from the stride the
+				 * encoder expects; stride-shift the mapped data
+				 * into dmabuf_warped first (same approach as the
+				 * FDC_DMABUF CPU path). */
+				size_t tx_stride =
+						(size_t)sfd->dmabuf_info.strides[0];
+				if (!sfd->dmabuf_warped) {
+					sfd->dmabuf_warped = zeroed_aligned_alloc(
+							alignz(sfd->buffer_size, 64),
+							64,
+							&sfd->dmabuf_warped_handle);
+					if (!sfd->dmabuf_warped) {
+						return;
+					}
+				}
+				stride_shifted_copy(sfd->dmabuf_warped,
+						sfd->mem_local, 0,
+						(size_t)sfd->dmabuf_info.height *
+								(size_t)map_stride,
+						(size_t)minu(map_stride, tx_stride),
+						map_stride, tx_stride);
+				data = sfd->dmabuf_warped;
+				map_stride = (uint32_t)tx_stride;
+			}
+		} else {
+			data = map_dmabuf(sfd->dmabuf_bo, false, &handle,
+					&map_stride);
+			if (!data) {
+				return;
+			}
 		}
 		copy_onto_video_mirror(data, map_stride, sfd->video_local_frame,
 				&sfd->dmabuf_info);
-		unmap_dmabuf(sfd->dmabuf_bo, handle);
+		if (handle) {
+			unmap_dmabuf(sfd->dmabuf_bo, handle);
+		}
 
 		if (sws_scale(sfd->video_color_context,
 				    (const uint8_t *const *)sfd

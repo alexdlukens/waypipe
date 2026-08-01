@@ -1498,11 +1498,25 @@ void do_zwp_linux_buffer_params_v1_req_create(struct context *ctx,
 		enum fdcat res_type = FDC_DMABUF;
 		if (ctx->g->config->video_if_possible) {
 			// TODO: multibuffer support
-			if (all_same_fds && video_supports_dmabuf_format(format,
+			// Only single-plane formats can be fed to the encoder/decoder:
+			// copy_onto/copy_from_video_mirror assume height rows per
+			// plane, which is wrong for chroma planes of multi-plane
+			// (YUV) formats.
+			if (params->nplanes == 1 && all_same_fds &&
+				    video_supports_dmabuf_format(format,
 							    info.modifier)) {
 				res_type = ctx->on_display_side ? FDC_DMAVID_IW
 								: FDC_DMAVID_IR;
 			}
+			wp_debug("dmabuf create fmt=%x planes=%d modifier=%llx video_enabled=%d -> %s",
+					format, params->nplanes,
+					(unsigned long long)info.modifier,
+					ctx->g->config->video_if_possible,
+					res_type == FDC_DMAVID_IR
+							? "DMAVID_IR"
+							: (res_type == FDC_DMAVID_IW
+									? "DMAVID_IW"
+									: "DMABUF(raw)"));
 		}
 
 		/* note: the``info` provided includes the incoming/as-if stride
