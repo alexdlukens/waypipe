@@ -202,7 +202,9 @@ static struct bench_result run_sub_bench(bool first,
 	memset(&render, 0, sizeof(render));
 	render.disabled = true;
 	render.drm_fd = 1;
+#ifdef HAS_DMABUF
 	render.av_disabled = true;
+#endif
 
 	struct bytebuf msg = {.size = sizeof(struct wmsg_open_file),
 			.data = (char *)&file_msg};

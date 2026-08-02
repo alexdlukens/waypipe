@@ -57,6 +57,7 @@ static inline uint32_t conntoken_header(const struct main_config *config,
 	if (config->compression == COMP_NONE) {
 		header |= CONN_NO_COMPRESSION;
 	}
+#ifdef HAS_VIDEO
 	if (config->video_if_possible) {
 		header |= (config->video_fmt == VIDEO_H264 ? CONN_H264_VIDEO
 							   : 0);
@@ -65,6 +66,12 @@ static inline uint32_t conntoken_header(const struct main_config *config,
 	} else {
 		header |= CONN_NO_VIDEO;
 	}
+#else
+	/* Without HAS_VIDEO the codec bits above are not meaningful; advertise
+	 * CONN_NO_VIDEO explicitly so the peer never sees an empty/unknown
+	 * video mask. */
+	header |= CONN_NO_VIDEO;
+#endif
 #ifdef HAS_DMABUF
 	header |= (config->no_gpu ? CONN_NO_DMABUF_SUPPORT : 0);
 #else

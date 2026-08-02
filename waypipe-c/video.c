@@ -95,6 +95,15 @@ void apply_video_packet(struct shadow_fd *sfd, struct render_data *rd,
 /* these are equivalent to the GBM formats */
 #include <libdrm/drm_fourcc.h>
 
+#ifdef __ANDROID__
+/* Android GBM surface: the AHardwareBuffer-backed shim
+ * (thirdparty/gbm-android) resolves <gbm.h> and restricts which DRM
+ * fourccs gbm_bo_create can allocate (drm_to_ahb_format).
+ * gbm_android_format_supported() exposes that exact set to the capability
+ * predicate below, so only mappable formats are advertised to peers. */
+#include <gbm.h>
+#endif
+
 #define VIDEO_H264_HW_ENCODER "h264_vaapi"
 #define VIDEO_H264_SW_ENCODER "libx264"
 #define VIDEO_H264_DECODER "h264"
@@ -214,7 +223,15 @@ bool video_supports_dmabuf_format(uint32_t format, uint64_t modifier)
 			modifier == fourcc_mod_code(INTEL, 5) /* Yf_TILED_CCS */ || modifier == fourcc_mod_code(INTEL, 6) /* Y_TILED_GEN12_RC_CCS */ || modifier == fourcc_mod_code(INTEL, 7) /* Y_TILED_GEN12_MC_CCS */ || modifier == fourcc_mod_code(INTEL, 8) /* Y_TILED_GEN12_RC_CCS_CC */) {
 		return false;
 	}
+#ifdef __ANDROID__
+	/* The GBM shim allocates only the formats drm_to_ahb_format maps
+	 * (gbm_android_format_supported). Advertising the full Linux set
+	 * would let a peer pick a format make_dmabuf() cannot create, and
+	 * video decode would never start. */
+	return gbm_android_format_supported(format);
+#else
 	return drm_to_av(format) != AV_PIX_FMT_NONE;
+#endif
 }
 bool video_supports_shm_format(uint32_t format)
 {
@@ -633,6 +650,17 @@ static bool pad_hardware_size(
 
 static int init_hwcontext(struct render_data *rd)
 {
+#ifdef __ANDROID__
+	/* Android has no /dev/dri render node and no VAAPI; the
+	 * AHardwareBuffer-backed GBM shim allocates decode targets without
+	 * any hardware device context. Forcing the software path here makes
+	 * setup_video_decode's existing "HW-decode fallback to software"
+	 * logic take the software branch deterministically (has_hw = false),
+	 * instead of attempting an AV_DRM device with fd -1 and failing with
+	 * misleading error logs. */
+	rd->av_disabled = true;
+	return -1;
+#else
 	if (rd->av_disabled) {
 		return -1;
 	}
@@ -699,6 +727,7 @@ static int init_hwcontext(struct render_data *rd)
 #endif
 
 	return 0;
+#endif /* __ANDROID__ */
 }
 
 void cleanup_hwcontext(struct render_data *rd)
@@ -795,11 +824,15 @@ static int setup_hwvideo_encode(
 	 * YUV420P typically don't work. */
 	const enum AVPixelFormat videofmt = AV_PIX_FMT_NV12;
 	const struct AVCodec *codec =
-			get_video_hw_encoder(sfd->video_fmt, true);
+		get_video_hw_encoder(sfd->video_fmt, false);
 	if (!codec) {
 		return -1;
 	}
 	struct AVCodecContext *ctx = avcodec_alloc_context3(codec);
+	if (!ctx) {
+		wp_error("Failed to allocate codec context");
+		return -1;
+	}
 	configure_low_latency_enc_context(
 			ctx, false, sfd->video_fmt, rd->av_bpf, nthreads);
 	if (!pad_hardware_size((int)sfd->dmabuf_info.width,
@@ -816,6 +849,11 @@ static int setup_hwvideo_encode(
 					rd->av_hwdevice_ref, NULL);
 	if (!constraints) {
 		wp_error("Failed to get hardware frame constraints");
+		goto fail_hwframe_constraints;
+	}
+	if (!constraints->valid_hw_formats) {
+		wp_error("No hardware frame formats available");
+		av_hwframe_constraints_free(&constraints);
 		goto fail_hwframe_constraints;
 	}
 	enum AVPixelFormat hw_format = constraints->valid_hw_formats[0];
@@ -880,6 +918,7 @@ static int setup_hwvideo_encode(
 	AVFrame *local_frame = av_frame_alloc();
 	if (!local_frame) {
 		wp_error("Failed to allocate local frame");
+		av_free(framedesc);
 		goto fail_frame_alloc;
 	}
 	local_frame->width = ctx->width;
@@ -890,6 +929,7 @@ static int setup_hwvideo_encode(
 			av_buffer_default_free, local_frame, 0);
 	if (!local_frame->buf[0]) {
 		wp_error("Failed to reference count frame DRM description");
+		av_free(framedesc);
 		goto fail_framedesc_ref;
 	}
 	local_frame->data[0] = (uint8_t *)framedesc;
@@ -966,8 +1006,12 @@ int setup_video_encode(
 	bool has_hw = init_hwcontext(rd) == 0;
 	/* Attempt hardware encoding, and if it doesn't succeed, fall back
 	 * to software encoding */
-	if (has_hw && setup_hwvideo_encode(sfd, rd, nthreads) == 0) {
-		return 0;
+	if (has_hw) {
+		if (setup_hwvideo_encode(sfd, rd, nthreads) == 0) {
+			return 0;
+		}
+		wp_debug("Hardware video encoding unavailable for RID=%d; falling back to software",
+				sfd->remote_id);
 	}
 
 	enum AVPixelFormat avpixfmt = drm_to_av(sfd->dmabuf_info.format);
@@ -1034,12 +1078,16 @@ int setup_video_encode(
 	/* adopt padded sizes */
 	local_frame->width = ctx->width;
 	local_frame->height = ctx->height;
-	if (av_image_alloc(local_frame->data, local_frame->linesize,
-			    local_frame->width, local_frame->height, avpixfmt,
-			    64) < 0) {
+	int local_img_size = av_image_alloc(local_frame->data,
+			local_frame->linesize, local_frame->width,
+			local_frame->height, avpixfmt, 64);
+	if (local_img_size < 0) {
 		wp_error("Failed to allocate temp image");
 		goto cleanup;
 	}
+	/* av_image_alloc does not zero the buffer; clear padding so
+	 * uninitialized bytes are not encoded into the stream */
+	memset(local_frame->data[0], 0, (size_t)local_img_size);
 
 	yuv_frame = av_frame_alloc();
 	if (!yuv_frame) {
@@ -1049,12 +1097,14 @@ int setup_video_encode(
 	yuv_frame->width = ctx->width;
 	yuv_frame->height = ctx->height;
 	yuv_frame->format = videofmt;
-	if (av_image_alloc(yuv_frame->data, yuv_frame->linesize,
-			    yuv_frame->width, yuv_frame->height, videofmt,
-			    64) < 0) {
+	int yuv_img_size = av_image_alloc(yuv_frame->data,
+			yuv_frame->linesize, yuv_frame->width,
+			yuv_frame->height, videofmt, 64);
+	if (yuv_img_size < 0) {
 		wp_error("Failed to allocate temp image");
 		goto cleanup;
 	}
+	memset(yuv_frame->data[0], 0, (size_t)yuv_img_size);
 	sws = sws_getContext(local_frame->width,
 			local_frame->height, avpixfmt, yuv_frame->width,
 			yuv_frame->height, videofmt, SWS_BILINEAR, NULL, NULL,
@@ -1107,6 +1157,14 @@ static enum AVPixelFormat get_decode_format(
 
 int setup_video_decode(struct shadow_fd *sfd, struct render_data *rd)
 {
+	/* Re-entry guard: a duplicate OPEN_DMAVID_DST must not leak or
+	 * replace a live context. */
+	if (sfd->video_context) {
+		wp_error("Video decode context already set up for RID=%d",
+				sfd->remote_id);
+		return -1;
+	}
+
 	bool has_hw = init_hwcontext(rd) == 0;
 
 	enum AVPixelFormat avpixfmt = drm_to_av(sfd->dmabuf_info.format);
@@ -1131,6 +1189,27 @@ int setup_video_decode(struct shadow_fd *sfd, struct render_data *rd)
 		return -1;
 	}
 
+	/* Determine whether this build's decoder actually registers a VAAPI
+	 * hardware config. The vendored ffmpeg is configured
+	 * --disable-hwaccels, so it will not, and the HW path must be
+	 * skipped rather than attempted and failed. */
+	bool hw_supported = false;
+	if (has_hw) {
+		for (int i = 0;; i++) {
+			const AVCodecHWConfig *cfg =
+					avcodec_get_hw_config(codec, i);
+			if (!cfg) {
+				break;
+			}
+			if (cfg->device_type == AV_HWDEVICE_TYPE_VAAPI &&
+					(cfg->methods &
+							AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX)) {
+				hw_supported = true;
+				break;
+			}
+		}
+	}
+
 	struct AVCodecContext *ctx = avcodec_alloc_context3(codec);
 	if (!ctx) {
 		wp_error("Failed to allocate context");
@@ -1138,33 +1217,71 @@ int setup_video_decode(struct shadow_fd *sfd, struct render_data *rd)
 	}
 
 	ctx->delay = 0;
-	if (has_hw) {
+	if (has_hw && hw_supported) {
 		/* If alignment permits, use hardware decoding */
-		has_hw = pad_hardware_size((int)sfd->dmabuf_info.width,
-				(int)sfd->dmabuf_info.height, &ctx->width,
-				&ctx->height);
+		if (!pad_hardware_size((int)sfd->dmabuf_info.width,
+					(int)sfd->dmabuf_info.height,
+					&ctx->width, &ctx->height)) {
+			has_hw = false;
+			hw_supported = false;
+		}
+	} else {
+		has_hw = false;
+		hw_supported = false;
 	}
 
-	if (has_hw) {
+	if (has_hw && hw_supported) {
 		ctx->hw_device_ctx = av_buffer_ref(rd->av_hwdevice_ref);
 		if (!ctx->hw_device_ctx) {
 			wp_error("Failed to reference hardware device context");
+			has_hw = false;
+			hw_supported = false;
+		} else {
+			ctx->get_format = get_decode_format;
 		}
-		ctx->get_format = get_decode_format;
-	} else {
+	}
+
+	if (!has_hw || !hw_supported) {
 		ctx->pix_fmt = videofmt;
 		/* set context dimensions, and allocate buffer to write into */
-
 		ctx->width = (int)sfd->dmabuf_info.width;
 		ctx->height = (int)sfd->dmabuf_info.height;
 		int linesize_align[AV_NUM_DATA_POINTERS];
 		avcodec_align_dimensions2(
 				ctx, &ctx->width, &ctx->height, linesize_align);
 	}
-	if (avcodec_open2(ctx, codec, NULL) < 0) {
-		wp_error("Failed to open codec");
-		avcodec_free_context(&ctx);
-		return -1;
+
+	int open_err = avcodec_open2(ctx, codec, NULL);
+	if (open_err < 0) {
+		if (has_hw && hw_supported) {
+			/* The HW-configured context failed to open (e.g. no
+			 * registered VAAPI hw_config, or get_format could not
+			 * obtain a surface). Retry once with a fresh software
+			 * context instead of hard-failing. */
+			wp_debug("HW decode open failed for RID=%d (%s); retrying in software",
+					sfd->remote_id, av_err2str(open_err));
+			avcodec_free_context(&ctx);
+			ctx = avcodec_alloc_context3(codec);
+			if (!ctx) {
+				wp_error("Failed to allocate context");
+				return -1;
+			}
+			ctx->delay = 0;
+			ctx->pix_fmt = videofmt;
+			ctx->width = (int)sfd->dmabuf_info.width;
+			ctx->height = (int)sfd->dmabuf_info.height;
+			int linesize_align[AV_NUM_DATA_POINTERS];
+			avcodec_align_dimensions2(
+					ctx, &ctx->width, &ctx->height,
+					linesize_align);
+			open_err = avcodec_open2(ctx, codec, NULL);
+		}
+		if (open_err < 0) {
+			wp_error("Failed to open codec: %s",
+					av_err2str(open_err));
+			avcodec_free_context(&ctx);
+			return -1;
+		}
 	}
 
 	struct AVFrame *yuv_frame = av_frame_alloc();
@@ -1217,6 +1334,19 @@ void collect_video_from_mirror(
 			}
 			data = sfd->mem_local;
 			map_stride = sfd->dmabuf_map_stride;
+			/* The mmap has length sfd->buffer_size; plane 0 begins
+			 * at dmabuf_info.offsets[0], so the final source read
+			 * is at offsets[0] + height*map_stride. Reading past
+			 * the mapping faults (SIGBUS); bail if it will not fit. */
+			size_t need = (size_t)sfd->dmabuf_info.offsets[0] +
+					(size_t)sfd->dmabuf_info.height *
+							(size_t)map_stride;
+			if (need > sfd->buffer_size) {
+				wp_error("CPU-mapped video buffer too small for RID=%d (need %zu, map %zu)",
+						sfd->remote_id, need,
+						sfd->buffer_size);
+				return;
+			}
 			if (map_stride != sfd->dmabuf_info.strides[0]) {
 				/* The mmap stride differs from the stride the
 				 * encoder expects; stride-shift the mapped data
@@ -1263,6 +1393,7 @@ void collect_video_from_mirror(
 				    sfd->video_yuv_frame->data,
 				    sfd->video_yuv_frame->linesize) < 0) {
 			wp_error("Failed to perform color conversion");
+			return;
 		}
 	}
 
@@ -1273,16 +1404,21 @@ void collect_video_from_mirror(
 		wp_error("Failed to create frame: %s", av_err2str(sendstat));
 		return;
 	}
-	// assume 1-1 frames to packets, at the moment
-	int recvstat = avcodec_receive_packet(
-			sfd->video_context, sfd->video_packet);
-	if (recvstat == AVERROR(EINVAL)) {
-		wp_error("Failed to receive packet for RID=%d", sfd->remote_id);
-		return;
-	} else if (recvstat == AVERROR(EAGAIN)) {
-		wp_error("Packet for RID=%d needs more input", sfd->remote_id);
-	}
-	if (recvstat == 0) {
+	/* A frame may yield zero, one, or several packets because of encoder
+	 * delay/buffering. Drain until the encoder needs more input or hits
+	 * EOF, emitting one transfer per produced packet. */
+	while (true) {
+		int recvstat = avcodec_receive_packet(
+				sfd->video_context, sfd->video_packet);
+		if (recvstat == AVERROR(EAGAIN) ||
+				recvstat == AVERROR_EOF) {
+			break;
+		}
+		if (recvstat < 0) {
+			wp_error("Failed to receive packet for RID=%d: %s",
+					sfd->remote_id, av_err2str(recvstat));
+			break;
+		}
 		struct AVPacket *pkt = sfd->video_packet;
 		size_t pktsz = (size_t)pkt->buf->size;
 		size_t msgsz = sizeof(struct wmsg_basic) + pktsz;
@@ -1294,7 +1430,8 @@ void collect_video_from_mirror(
 				transfer_header(msgsz, WMSG_SEND_DMAVID_PACKET);
 		header->remote_id = sfd->remote_id;
 
-		memcpy(buf + sizeof(struct wmsg_basic), pkt->buf->data, pktsz);
+		memcpy(buf + sizeof(struct wmsg_basic), pkt->buf->data,
+				pktsz);
 		memset(buf + msgsz, 0, alignz(msgsz, 4) - msgsz);
 
 		transfer_add(transfers, alignz(msgsz, 4), buf);
@@ -1399,6 +1536,23 @@ void apply_video_packet(struct shadow_fd *sfd, struct render_data *rd,
 					return;
 				}
 			}
+			/* The DMABUF-shaped local frame was sized once at setup;
+			 * if the decoder emits a frame whose dimensions differ,
+			 * the color conversion would write out of bounds. Drop
+			 * the frame rather than corrupting the surface. */
+			if (cpu_frame->width !=
+					    sfd->video_local_frame->width ||
+					cpu_frame->height !=
+					    sfd->video_local_frame->height) {
+				wp_error("Decoded frame %dx%d mismatches setup %dx%d for RID=%d; dropping",
+						cpu_frame->width,
+						cpu_frame->height,
+						sfd->video_local_frame->width,
+						sfd->video_local_frame->height,
+						sfd->remote_id);
+				return;
+			}
+
 
 			/* Handle frame immediately, since the next receive run
 			 * will clear it again */

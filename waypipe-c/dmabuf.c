@@ -124,6 +124,31 @@ int init_render_data(struct render_data *data)
 		// Silent return, idempotent
 		return 0;
 	}
+#ifdef __ANDROID__
+	/* Android has no /dev/dri render node and the app sandbox forbids
+	 * DRM/allocator nodes entirely (no minigbm: its drv layer requires
+	 * kernel allocator access that app sepolicy denies). The
+	 * AHardwareBuffer-backed GBM shim (thirdparty/gbm-android) needs no
+	 * DRM fd: gbm_create_device ignores it, and every buffer is a genuine
+	 * dma-buf fd exported via AHardwareBuffer_getNativeHandle. */
+	if (data->dev != NULL) {
+		// Silent return, idempotent
+		return 0;
+	}
+	struct gbm_device *dev = gbm_create_device(-1);
+	if (!dev) {
+		data->disabled = true;
+		wp_error("Failed to create GBM (AHardwareBuffer) device");
+		return -1;
+	}
+	data->dev = dev;
+	data->drm_fd = -1;
+	data->drm_node_path = NULL;
+	/* AHardwareBuffer has no modifier concept; use the old linear
+	 * creation path (gbm_bo_create) for every buffer. */
+	data->supports_modifiers = false;
+	return 0;
+#else
 	const char *card = data->drm_node_path ? data->drm_node_path
 					       : "/dev/dri/renderD128";
 
@@ -151,6 +176,7 @@ int init_render_data(struct render_data *data)
 	 * if the newer path errors out */
 	data->supports_modifiers = true;
 	return 0;
+#endif /* __ANDROID__ */
 }
 void cleanup_render_data(struct render_data *data)
 {
@@ -160,6 +186,14 @@ void cleanup_render_data(struct render_data *data)
 		data->dev = NULL;
 		data->drm_fd = -1;
 	}
+#ifdef __ANDROID__
+	/* The Android shim device owns no fd (drm_fd stays -1), so the
+	 * branch above never fires; release the shim device explicitly. */
+	if (data->dev != NULL) {
+		gbm_device_destroy(data->dev);
+		data->dev = NULL;
+	}
+#endif
 }
 
 static bool dmabuf_info_valid(const struct dmabuf_slice_data *info)

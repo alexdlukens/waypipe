@@ -1404,7 +1404,11 @@ void collect_update(struct thread_pool *threads, struct shadow_fd *sfd,
 				}
 			}
 		}
-		if (sfd->only_here) {
+		/* Only advertise the remote decode target once frames can
+		 * actually be produced; with the CPU fallback the mmap above
+		 * may still have failed, and a target that never receives
+		 * packets is worse than a delayed one. */
+		if (sfd->only_here && (!sfd->cpu_mapped || sfd->mem_local)) {
 			sfd->only_here = false;
 			if (use_old_dmavid_req) {
 				add_dmabuf_create_request(transfers, sfd,
@@ -1821,6 +1825,21 @@ int apply_update(struct fd_translation_map *map, struct thread_pool *threads,
 			}
 		}
 
+		/* copy_from_video_mirror() writes `height` rows for every
+		 * plane at offsets[i], which is only correct for single-plane
+		 * formats; a multi-plane layout from the wire would write
+		 * past the end of the mapping. */
+		if (sfd->dmabuf_info.num_planes != 1) {
+			wp_error("Video target for RID=%d has %d planes, only single-plane buffers are supported",
+					sfd->remote_id,
+					sfd->dmabuf_info.num_planes);
+			/* open_sfd() already registered this shadow_fd; reject the
+			 * whole connection like the other invalid-open cases so the
+			 * registered-but-invalid sfd is torn down with the map
+			 * instead of lingering as a zombie until teardown. */
+			return ERR_FATAL;
+		}
+
 		if (init_render_data(render) == -1) {
 			sfd->fd_local = -1;
 			return 0;
@@ -1886,9 +1905,21 @@ int apply_update(struct fd_translation_map *map, struct thread_pool *threads,
 						(enum video_coding_fmt)vid_type;
 			} else {
 				wp_error("Unidentified video format %u for RID=%d",
-						sfd->remote_id);
+						vid_type, sfd->remote_id);
 				return ERR_FATAL;
 			}
+		}
+
+		/* see WMSG_OPEN_DMAVID_DST: copy_onto_video_mirror() reads
+		 * `height` rows per plane, so only single-plane buffers can
+		 * be fed to the encoder */
+		if (sfd->dmabuf_info.num_planes != 1) {
+			wp_error("Video source for RID=%d has %d planes, only single-plane buffers are supported",
+					sfd->remote_id,
+					sfd->dmabuf_info.num_planes);
+			/* See WMSG_OPEN_DMAVID_DST: reject the connection so the
+			 * registered shadow_fd is cleaned up with the map. */
+			return ERR_FATAL;
 		}
 
 		if (init_render_data(render) == -1) {
@@ -2287,6 +2318,10 @@ int apply_update(struct fd_translation_map *map, struct thread_pool *threads,
 		return 0;
 	}
 	case WMSG_SEND_DMAVID_PACKET: {
+		if ((ret = check_message_min_size(type, msg,
+				     sizeof(struct wmsg_basic))) < 0) {
+			return ret;
+		}
 		if ((ret = check_sfd_type(sfd, remote_id, type,
 				     FDC_DMAVID_IW)) < 0) {
 			return ret;
