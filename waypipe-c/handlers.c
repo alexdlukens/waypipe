@@ -211,6 +211,7 @@ static const struct wp_interface *const global_interfaces[] = {
 		&intf_zwlr_screencopy_manager_v1,
 		&intf_zwp_input_method_manager_v2,
 		&intf_zwp_linux_dmabuf_v1,
+		&intf_zwp_linux_dmabuf_feedback_v1,
 		&intf_zwp_primary_selection_device_manager_v1,
 		&intf_zwp_virtual_keyboard_manager_v1,
 };
@@ -486,18 +487,20 @@ void do_wl_registry_req_bind(struct context *ctx, uint32_t name,
 					       sizeof(global_interfaces[0]);
 			i++) {
 		if (!strcmp(interface, global_interfaces[i]->name)) {
-			// Set the object type
-			the_object->type = global_interfaces[i];
-			if (global_interfaces[i] == &intf_wp_presentation) {
-				struct wp_object *new_object = create_wp_object(
-						obj_id, &intf_wp_presentation);
-				if (!new_object) {
-					return;
-				}
-				tracker_replace_existing(
-						ctx->tracker, new_object);
-				free(the_object);
+			/* The object was created while parsing the bind request
+			 * without a statically-known interface (wl_registry::bind
+			 * names it dynamically), so its allocation only covers the
+			 * base wp_object. Replace it with a correctly-sized object
+			 * carrying the interface's private data; otherwise handlers
+			 * for interfaces with extra fields (e.g.
+			 * zwp_linux_dmabuf_feedback_v1) overflow the allocation. */
+			struct wp_object *new_object = create_wp_object(
+					obj_id, global_interfaces[i]);
+			if (!new_object) {
+				goto fail;
 			}
+			tracker_replace_existing(ctx->tracker, new_object);
+			free(the_object);
 			return;
 		}
 	}
@@ -1728,14 +1731,31 @@ void do_zwp_linux_dmabuf_feedback_v1_evt_format_table(
 	if (fdtype == FDC_UNKNOWN) {
 		fdtype = FDC_FILE;
 	}
-	if (fdtype != FDC_FILE || fdsz != size) {
-		wp_error("format tabl fd %d was not file-like (type=%s), and size=%zu did not match %u",
-				fd, fdcat_to_str(fdtype), fdsz, size);
+	if (fdtype != FDC_FILE) {
+		/* This fd cannot be transferred as a regular file. Drop the
+		 * event and its fd consistently instead of leaving the fd
+		 * unregistered and later poisoning the channel with an id
+		 * whose transfer was never queued. */
+		wp_error("format table fd %d was not file-like (type=%s); dropping format_table event",
+				fd, fdcat_to_str(fdtype));
+		ctx->drop_this_msg = true;
 		return;
+	}
+	if (fdsz != size) {
+		/* The compositor reported a size that does not match the
+		 * actual file. Forward the file with its true size and patch
+		 * the event's size field (first payload word; the fd itself
+		 * travels in the fd array) so the remote end observes a
+		 * consistent (fd, size) pair. */
+		wp_error("format table fd %d size mismatch: reported %u, actual %zu; forwarding with actual size",
+				fd, size, fdsz);
+		size = (uint32_t)fdsz;
+		ctx->message[2] = size;
 	}
 	struct shadow_fd *sfd = translate_fd(&ctx->g->map, &ctx->g->render,
 			&ctx->g->threads, fd, FDC_FILE, size, NULL, false);
 	if (!sfd) {
+		ctx->drop_this_msg = true;
 		return;
 	}
 	/* Mark the shadow structure as owned by the protocol, but do not

@@ -395,6 +395,15 @@ void *map_dmabuf(struct gbm_bo *bo, bool write, void **map_handle,
 		wp_error("Failed to map dmabuf");
 		return NULL;
 	}
+	/* Defensive: if the backend reported a zero stride (observed with the
+	 * Android AHardwareBuffer shim's lockPlanes on Qualcomm gralloc, which
+	 * returns rowStride=0 for BGRA_8888), fall back to the buffer's own
+	 * reported row stride so the copy routines' row math stays correct
+	 * (a zero map_stride makes copy_from_video_mirror copy 0 bytes/row and
+	 * decoded frames never reach the buffer). */
+	if (stride == 0) {
+		stride = gbm_bo_get_stride(bo);
+	}
 	*exp_stride = stride;
 	return data;
 }

@@ -141,38 +141,44 @@ static int translate_fds(struct fd_translation_map *map,
 		struct render_data *render, struct thread_pool *threads,
 		int nfds, const int fds[], int ids[])
 {
+	(void)render;
+	(void)threads;
 	for (int i = 0; i < nfds; i++) {
 		struct shadow_fd *sfd = get_shadow_for_local_fd(map, fds[i]);
 		if (!sfd) {
-			/* Autodetect type + create shadow fd */
-			size_t fdsz = 0;
-			enum fdcat fdtype = get_fd_type(fds[i], &fdsz);
-			sfd = translate_fd(map, render, threads, fds[i], fdtype,
-					fdsz, NULL, false);
-		}
-		if (sfd) {
-			ids[i] = sfd->remote_id;
-		} else {
+			/* advance_waymsg_progread() must have created (and dirtied)
+			 * a shadow for every fd the protocol parser consumed before
+			 * collect_update() ran, so that each id referenced by
+			 * WMSG_INJECT_RIDS has its content transfer queued in the
+			 * same channel batch. Creating a shadow here would be too
+			 * late: the transfer would be missing and the peer would be
+			 * unable to untranslate the id. Abort instead. */
+			wp_error("No shadow registered for fd %d before collect_update; aborting channel",
+					fds[i]);
 			return -1;
 		}
+		ids[i] = sfd->remote_id;
 	}
 	return 0;
 }
 /** Given a list of global ids, and an up-to-date translation map, produce local
- * file descriptors */
-static void untranslate_ids(struct fd_translation_map *map, int nids,
+ * file descriptors. Returns 0 on success, -1 if any id is not present in the
+ * map; the caller must abort the channel in that case, because writing a
+ * poisoned fd (-1) into the local program's stream would crash the
+ * application instead. */
+static int untranslate_ids(struct fd_translation_map *map, int nids,
 		const int *ids, int *fds)
 {
 	for (int i = 0; i < nids; i++) {
 		struct shadow_fd *shadow = get_shadow_for_rid(map, ids[i]);
 		if (!shadow) {
-			wp_error("Could not untranslate remote id %d in map. Application will probably crash.",
+			wp_error("Could not untranslate remote id %d in map; aborting channel instead of poisoning the application",
 					ids[i]);
-			fds[i] = -1;
-		} else {
-			fds[i] = shadow->fd_local;
+			return -1;
 		}
+		fds[i] = shadow->fd_local;
 	}
+	return 0;
 }
 
 enum wm_state { WM_WAITING_FOR_PROGRAM, WM_WAITING_FOR_CHANNEL, WM_TERMINAL };
@@ -313,7 +319,10 @@ static int interpret_chanmsg(struct chan_msg_state *cmsg,
 		/* Reset transfer buffer; all fds in here were already sent */
 		cmsg->transf_fds.zone_start = 0;
 		cmsg->transf_fds.zone_end = nfds;
-		untranslate_ids(&g->map, nfds, fds, cmsg->transf_fds.data);
+		if (untranslate_ids(&g->map, nfds, fds,
+				    cmsg->transf_fds.data) == -1) {
+			return ERR_FATAL;
+		}
 		if (nfds > 0) {
 			if (buf_ensure_size(cmsg->proto_fds.zone_end + nfds,
 					    sizeof(int), &cmsg->proto_fds.size,
@@ -927,6 +936,45 @@ static int advance_waymsg_progread(struct way_msg_state *wmsg,
 			wmsg->proto_read.zone_end -=
 					wmsg->proto_read.zone_start;
 			wmsg->proto_read.zone_start = 0;
+		}
+	}
+
+	/* The WMSG_INJECT_RIDS message built below references the id of every
+	 * shadow corresponding to an fd the protocol parser consumed. The wire
+	 * invariant is that every referenced id must have its shadow transfer
+	 * (WMSG_OPEN_FILE/EXTEND/DMABUF/...) queued in the SAME channel batch,
+	 * ahead of the INJECT_RIDS message, so the peer can untranslate the id.
+	 * Lazily creating shadows in translate_fds() runs after collect_update(),
+	 * which would leave the peer with no shadow for the referenced id and
+	 * force it to abort the channel. Ensure the shadows exist and are marked
+	 * dirty before the collect_update() loop below runs. */
+	if (new_proto_data && wmsg->fds.zone_start > 0) {
+		for (int i = 0; i < wmsg->fds.zone_start; i++) {
+			int lfd = wmsg->fds.data[i];
+			struct shadow_fd *sfd = get_shadow_for_local_fd(&g->map, lfd);
+			if (!sfd) {
+				size_t fdsz = 0;
+				enum fdcat fdtype = get_fd_type(lfd, &fdsz);
+				if (fdtype == FDC_UNKNOWN) {
+					/* Nothing transferable can be built for this
+					 * fd; abort the channel rather than emitting
+					 * an id with no queued transfer. */
+					wp_error("Cannot create shadow for fd %d (unknown fd type); aborting channel",
+							lfd);
+					return ERR_FATAL;
+				}
+				sfd = translate_fd(&g->map, &g->render, &g->threads,
+						lfd, fdtype, fdsz, NULL, false);
+				if (!sfd) {
+					wp_error("Failed to create shadow for fd %d; aborting channel",
+							lfd);
+					return ERR_FATAL;
+				}
+			}
+			/* Re-transfer even shadows that are clean or owned by the
+			 * protocol: an id must never be referenced without its
+			 * content transfer being queued in this batch. */
+			sfd->is_dirty = true;
 		}
 	}
 
