@@ -35,6 +35,7 @@
 #include <sys/uio.h>
 
 #include "config-waypipe.h"
+#include "embed.h"
 
 #ifdef HAS_USDT
 #include <sys/sdt.h>
@@ -49,21 +50,6 @@
 // handlers can write it safely and worker threads re-read it in polling loops.
 extern volatile sig_atomic_t shutdown_flag;
 extern uint64_t inherited_fds[4];
-
-/** When true, waypipe is running in an embedded host process where forking
- * worker subprocesses is undesirable. */
-void waypipe_set_embedded_no_fork_mode(bool enabled);
-bool waypipe_get_embedded_no_fork_mode(void);
-int waypipe_poll_timeout_ms(int requested_timeout_ms);
-
-uint64_t waypipe_get_current_owner_key(void);
-void waypipe_request_owner_shutdown(uint64_t owner_key);
-void waypipe_clear_owner_shutdown(uint64_t owner_key);
-bool waypipe_owner_shutdown_requested(uint64_t owner_key);
-bool waypipe_owner_shutdown_requested_current_thread(void);
-void waypipe_register_owned_child_pid(uint64_t owner_key, pid_t pid);
-void waypipe_unregister_owned_child_pid(pid_t pid);
-void waypipe_force_terminate_owned_children(uint64_t owner_key);
 
 void handle_sigint(int sig);
 
@@ -256,11 +242,6 @@ typedef void (*log_handler_func_t)(const char *file, int line,
  * 'main'. The first one is the debug handler, second error handler. Set them to
  * NULL to disable log messages. */
 extern log_handler_func_t log_funcs[2];
-
-/** Optional sink for fully formatted waypipe log lines. Embedders can set this
- * to mirror logs into their own buffers while preserving normal stderr output. */
-typedef void (*waypipe_log_sink_func_t)(const char *line, size_t len);
-extern waypipe_log_sink_func_t waypipe_log_sink;
 
 #ifdef WAYPIPE_REL_SRC_DIR
 #define WAYPIPE__FILE__                                                        \

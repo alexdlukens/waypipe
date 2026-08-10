@@ -76,7 +76,10 @@ void cleanup_render_data(struct render_data *);
 struct gbm_bo *make_dmabuf(
 		struct render_data *rd, const struct dmabuf_slice_data *info);
 int export_dmabuf(struct gbm_bo *bo);
-/** Import DMABUF to a GBM buffer object. */
+/** Import DMABUF to a GBM buffer object. When render_data is in CPU-fallback
+ * mode (cpu_dmabuf_fallback), no GBM import is attempted: *size is computed
+ * from the slice info (or the fd itself) and NULL is returned; the fd is then
+ * mmap'd on first use via map_dmabuf_cpu. */
 struct gbm_bo *import_dmabuf(struct render_data *rd, int fd, size_t *size,
 		const struct dmabuf_slice_data *info);
 void destroy_dmabuf(struct gbm_bo *bo);
@@ -84,6 +87,14 @@ void destroy_dmabuf(struct gbm_bo *bo);
 void *map_dmabuf(struct gbm_bo *bo, bool write, void **map_handle,
 		uint32_t *exp_stride);
 int unmap_dmabuf(struct gbm_bo *bo, void *map_handle);
+/** CPU-fallback variant of map_dmabuf: mmap the fd that backs a DMABUF which
+ * could not be imported into GBM (import_dmabuf with cpu_dmabuf_fallback).
+ * The mapping persists until the buffer is destroyed (there is no matching
+ * unmap step). Returns NULL if the fd could not be mapped; the caller may
+ * retry on a later update cycle. *exp_stride receives the row stride at which
+ * the buffer is mapped. */
+void *map_dmabuf_cpu(int fd, size_t size, uint32_t stride,
+		uint32_t *exp_stride);
 /** The handle values are unique among the set of currently active buffer
  * objects. To compare a set of buffer objects, produce handles in a batch, and
  * then free the temporary buffer objects in a batch */

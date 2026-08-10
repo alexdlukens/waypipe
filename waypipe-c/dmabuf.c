@@ -25,7 +25,40 @@
 
 #include "dmabuf.h"
 #include "util.h"
+#include <errno.h>
 #include <stddef.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <unistd.h>
+
+/** Compute the byte size of a CPU-fallback dmabuf from its slice metadata,
+ * falling back to the fd's own size for non-RGBA/planar formats. */
+static void dmabuf_cpu_size(int fd, const struct dmabuf_slice_data *info,
+		size_t *size)
+{
+	int bpp = get_shm_bytes_per_pixel(info->format);
+	if (bpp > 0) {
+		*size = (size_t)info->height * (size_t)info->strides[0];
+	} else {
+		*size = (size_t)lseek(fd, 0, SEEK_END);
+		lseek(fd, 0, SEEK_SET);
+	}
+}
+
+void *map_dmabuf_cpu(int fd, size_t size, uint32_t stride,
+		uint32_t *exp_stride)
+{
+	if (size == 0) {
+		return NULL;
+	}
+	void *map = mmap(NULL, size, PROT_READ, MAP_SHARED, fd, 0);
+	if (map == MAP_FAILED) {
+		wp_error("CPU dmabuf mmap failed: %s", strerror(errno));
+		return NULL;
+	}
+	*exp_stride = stride;
+	return map;
+}
 
 #ifndef HAS_DMABUF
 
@@ -41,10 +74,11 @@ void cleanup_render_data(struct render_data *data) { (void)data; }
 struct gbm_bo *import_dmabuf(struct render_data *rd, int fd, size_t *size,
 		const struct dmabuf_slice_data *info)
 {
-	(void)rd;
-	(void)fd;
-	(void)size;
-	(void)info;
+	if (rd->cpu_dmabuf_fallback) {
+		/* CPU fallback: no GBM import; compute the buffer size and
+		 * leave the fd to be mmap'd via map_dmabuf_cpu. */
+		dmabuf_cpu_size(fd, info, size);
+	}
 	return NULL;
 }
 int get_unique_dmabuf_handle(
@@ -211,6 +245,14 @@ static bool dmabuf_info_valid(const struct dmabuf_slice_data *info)
 struct gbm_bo *import_dmabuf(struct render_data *rd, int fd, size_t *size,
 		const struct dmabuf_slice_data *info)
 {
+	if (rd->cpu_dmabuf_fallback) {
+		/* CPU fallback: no GBM import is possible (render node
+		 * unavailable); compute the buffer size and leave the fd to
+		 * be mmap'd on first use via map_dmabuf_cpu. */
+		dmabuf_cpu_size(fd, info, size);
+		return NULL;
+	}
+
 	struct gbm_bo *bo;
 	if (!dmabuf_info_valid(info)) {
 		return NULL;
