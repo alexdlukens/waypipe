@@ -1581,51 +1581,6 @@ static int setup_color_conv(struct shadow_fd *sfd, struct AVFrame *cpu_frame)
 	return 0;
 }
 
-/* DIAG: count non-zero pixels in a sample region of a single-plane RGB
- * buffer (bpp bytes/pixel). Cheap (<=64x128 px) so it is safe at frame rate. */
-static void diag_pixel_probe(const char *tag, const uint8_t *base,
-		size_t stride, uint32_t width, uint32_t height, uint32_t bpp,
-		int64_t frame_no)
-{
-	/* DIAG rate limit: once the write path is fixed and real video flows,
-	 * this probe runs once per decoded frame (~30-60/s). Allow each tag at
-	 * most one line per 1000 ms; the first call always prints. */
-	{
-		struct timespec ts;
-		clock_gettime(CLOCK_MONOTONIC, &ts);
-		uint64_t now = (uint64_t)ts.tv_sec * 1000 + (uint64_t)ts.tv_nsec / 1000000;
-		static uint64_t last = 0;
-		if (now - last < 1000) {
-			return;
-		}
-		last = now;
-	}
-	size_t ph = height < 64 ? height : 64;
-	size_t pw = width < 128 ? width : 128;
-	size_t nonzero = 0;
-	uint32_t fr = 0, fg = 0, fb = 0;
-	bool found = false;
-	if (base) {
-		for (size_t y = 0; y < ph; y++) {
-			const uint8_t *row = base + y * stride;
-			for (size_t x = 0; x < pw; x++) {
-				const uint8_t *p = row + x * bpp;
-				if (p[0] || p[1] || p[2]) {
-					nonzero++;
-					if (!found) {
-						found = true;
-						fr = p[0]; fg = p[1]; fb = p[2];
-					}
-				}
-			}
-		}
-	}
-	DIAG_VIDEO_LOG("[%s] frame=%lld w=%u h=%u stride=%zu bpp=%u "
-			"probe=%zux%zu nonzero=%zu first=(%u,%u,%u)\n",
-			tag, (long long)frame_no, width, height, stride, bpp,
-			ph, pw, nonzero, fr, fg, fb);
-}
-
 void apply_video_packet(struct shadow_fd *sfd, struct render_data *rd,
 		const struct bytebuf *msg)
 {
@@ -1644,12 +1599,6 @@ void apply_video_packet(struct shadow_fd *sfd, struct render_data *rd,
 				sfd->video_context, sfd->video_yuv_frame);
 		if (recvstat == 0) {
 			struct AVFrame *cpu_frame = sfd->video_yuv_frame;
-			DIAG_VIDEO_LOG("[decode] frame=%lld received cpu=%dx%d fmt=%d "
-					"target=0x%x %ux%u\n",
-					(long long)sfd->video_frameno, cpu_frame->width,
-					cpu_frame->height, cpu_frame->format,
-					sfd->dmabuf_info.format, sfd->dmabuf_info.width,
-					sfd->dmabuf_info.height);
 #if HAS_VAAPI
 			if (sfd->video_va_surface &&
 					sfd->video_yuv_frame->format ==
@@ -1732,22 +1681,11 @@ void apply_video_packet(struct shadow_fd *sfd, struct render_data *rd,
 			void *data = map_dmabuf(sfd->dmabuf_bo, true, &handle,
 					&map_stride);
 			if (!data) {
-				DIAG_VIDEO_LOG("[decode] frame=%lld map_dmabuf NULL "
-						"(lockPlanes failed?) w=%u h=%u; dropping\n",
-						(long long)sfd->video_frameno,
-						sfd->dmabuf_info.width,
-						sfd->dmabuf_info.height);
 				return;
 			}
 			copy_from_video_mirror(data, map_stride,
 					sfd->video_local_frame,
 					&sfd->dmabuf_info);
-			/* DIAG: what did we actually write into the buffer the
-			 * compositor will import? 4 bpp for all accepted formats. */
-			diag_pixel_probe("decode-write", (const uint8_t *)data,
-					map_stride, sfd->dmabuf_info.width,
-					sfd->dmabuf_info.height, 4,
-					sfd->video_frameno);
 			unmap_dmabuf(sfd->dmabuf_bo, handle);
 		} else {
 			if (recvstat != AVERROR(EAGAIN)) {

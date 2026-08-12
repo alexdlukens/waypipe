@@ -82,21 +82,6 @@ int run_client(int cwd_fd, const char *sock_folder_name, int sock_folder_fd,
 /** Run benchmarking tool; n_worker_threads defined as with \ref main_config */
 int run_bench(float bandwidth_mBps, uint32_t test_size, int n_worker_threads);
 
-/** Optional in-process SSH launcher hook for MODE_SSH.
- *
-	* When configured, waypipe will call this function instead of invoking
-	* `posix_spawnp("ssh", ...)`. In embedded no-fork mode, the callback may run
-	* on a detached worker thread; otherwise it runs in a forked child process.
- *
- * The callback receives argv in the same form as an ssh CLI call, starting
- * with argv[0] == "ssh".
- */
-typedef int (*waypipe_ssh_inprocess_main_func_t)(
-		int argc, char **argv, void *user_data);
-
-void waypipe_set_ssh_inprocess_main_func(
-		waypipe_ssh_inprocess_main_func_t p_func, void *p_user_data);
-
 /** Embeddable waypipe CLI entrypoint (same behavior as the executable main). */
 int waypipe_main(int argc, char **argv);
 

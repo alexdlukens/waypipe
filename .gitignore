@@ -12,3 +12,6 @@
 /wrap-zstd/target
 /wrap-gbm/target
 /shaders/target
+
+# scons object files
+*.os

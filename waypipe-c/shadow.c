@@ -660,50 +660,22 @@ struct shadow_fd *translate_fd(struct fd_translation_map *map,
 
 		memcpy(&sfd->dmabuf_info, info,
 				sizeof(struct dmabuf_slice_data));
-		if (render->cpu_dmabuf_fallback) {
-			// CPU fallback: skip the GBM import and encode from the
-			// mmap'd buffer instead. The encoder is set up from
-			// dmabuf_info alone; no dmabuf_bo is available.
-			sfd->cpu_mapped = true;
-			int bpp = get_shm_bytes_per_pixel(info->format);
-			if (bpp > 0) {
-				sfd->buffer_size = (size_t)info->height *
-						(size_t)info->strides[0];
-			} else {
-				sfd->buffer_size = (size_t)lseek(
-						sfd->fd_local, 0, SEEK_END);
-				lseek(sfd->fd_local, 0, SEEK_SET);
-			}
-			sfd->mem_local = mmap(NULL, sfd->buffer_size,
-					PROT_READ, MAP_SHARED, sfd->fd_local,
-					0);
-			if (sfd->mem_local == MAP_FAILED) {
-				wp_error("CPU dmabuf mmap failed for RID=%d: %s",
-						sfd->remote_id, strerror(errno));
-				sfd->mem_local = NULL;
-			} else {
-				sfd->dmabuf_map_handle = NULL;
-				sfd->dmabuf_map_stride =
-						sfd->dmabuf_info.strides[0];
-			}
-			sfd->mem_mirror = NULL;
-			if (setup_video_encode(sfd, render,
-					    threads->nthreads) == -1) {
-				wp_error("Video encoding setup failed for RID=%d",
-						sfd->remote_id);
-			}
-		} else {
-			init_render_data(render);
-			sfd->dmabuf_bo = import_dmabuf(render, sfd->fd_local,
-					&sfd->buffer_size, &sfd->dmabuf_info);
-			if (!sfd->dmabuf_bo) {
-				return sfd;
-			}
-			if (setup_video_encode(sfd, render,
-					    threads->nthreads) == -1) {
-				wp_error("Video encoding setup failed for RID=%d",
-						sfd->remote_id);
-			}
+		/* With the CPU fallback, import_dmabuf computes the buffer
+		 * size and returns NULL; the fd is mmap'd on first use in
+		 * collect_update instead. */
+		init_render_data(render);
+		sfd->dmabuf_bo = import_dmabuf(render, sfd->fd_local,
+				&sfd->buffer_size, &sfd->dmabuf_info);
+		if (!sfd->dmabuf_bo && !render->cpu_dmabuf_fallback) {
+			// GBM import failed and there is no CPU fallback
+			return sfd;
+		}
+		sfd->cpu_mapped = render->cpu_dmabuf_fallback;
+		sfd->mem_mirror = NULL;
+		if (setup_video_encode(sfd, render,
+				    threads->nthreads) == -1) {
+			wp_error("Video encoding setup failed for RID=%d",
+					sfd->remote_id);
 		}
 #endif
 	} break;
@@ -729,34 +701,20 @@ struct shadow_fd *translate_fd(struct fd_translation_map *map,
 	case FDC_DMABUF: {
 		sfd->buffer_size = 0;
 
-		if (render->cpu_dmabuf_fallback) {
-			// CPU fallback: don't use GBM import.
-			memcpy(&sfd->dmabuf_info, info,
-					sizeof(struct dmabuf_slice_data));
-			sfd->cpu_mapped = true;
-			// Compute buffer_size from dimensions or fd size
-			int bpp = get_shm_bytes_per_pixel(info->format);
-			if (bpp > 0) {
-				sfd->buffer_size = (size_t)info->height *
-						(size_t)info->strides[0];
-			} else {
-				sfd->buffer_size = (size_t)lseek(
-						sfd->fd_local, 0, SEEK_END);
-				lseek(sfd->fd_local, 0, SEEK_SET);
-			}
-			sfd->mem_mirror = NULL;
-		} else {
-			// Existing GBM path
-			init_render_data(render);
-			memcpy(&sfd->dmabuf_info, info,
-					sizeof(struct dmabuf_slice_data));
-			sfd->dmabuf_bo = import_dmabuf(render, sfd->fd_local,
-					&sfd->buffer_size, &sfd->dmabuf_info);
-			if (!sfd->dmabuf_bo) {
-				return sfd;
-			}
-			sfd->mem_mirror = NULL;
+		memcpy(&sfd->dmabuf_info, info,
+				sizeof(struct dmabuf_slice_data));
+		/* With the CPU fallback, import_dmabuf computes the buffer
+		 * size and returns NULL; the fd is mmap'd on first use in
+		 * collect_update instead. */
+		init_render_data(render);
+		sfd->dmabuf_bo = import_dmabuf(render, sfd->fd_local,
+				&sfd->buffer_size, &sfd->dmabuf_info);
+		if (!sfd->dmabuf_bo && !render->cpu_dmabuf_fallback) {
+			// GBM import failed and there is no CPU fallback
+			return sfd;
 		}
+		sfd->cpu_mapped = render->cpu_dmabuf_fallback;
+		sfd->mem_mirror = NULL;
 	} break;
 	case FDC_UNKNOWN:
 		wp_error("Trying to create shadow_fd for unknown filedesc type");
@@ -1323,34 +1281,31 @@ void collect_update(struct thread_pool *threads, struct shadow_fd *sfd,
 			add_dmabuf_create_request(
 					transfers, sfd, WMSG_OPEN_DMABUF);
 		}
-		// CPU fallback path — works on Linux + Android
-		if (sfd->cpu_mapped) {
-			if (!sfd->mem_local) {
-				sfd->mem_local = mmap(NULL, sfd->buffer_size,
-						PROT_READ, MAP_SHARED,
-						sfd->fd_local, 0);
-				if (sfd->mem_local == MAP_FAILED) {
-					wp_error("CPU dmabuf mmap failed: %s",
-							strerror(errno));
-					sfd->mem_local = NULL;
-					return;
-				}
-				sfd->dmabuf_map_handle = NULL;
-				sfd->dmabuf_map_stride =
-					sfd->dmabuf_info.strides[0];
-			}
-		} else {
-			// Existing GBM path
-			if (!sfd->dmabuf_bo) {
-				return;
-			}
-			if (!sfd->mem_local) {
+		// Ensure the buffer is CPU-readable. GBM-backed buffers are
+		// mapped for the duration of this update cycle (finish_update
+		// unmaps them); CPU-fallback buffers are mmap'd once and stay
+		// mapped until the shadow is destroyed.
+		if (!sfd->mem_local) {
+			if (sfd->dmabuf_bo) {
 				sfd->mem_local = map_dmabuf(sfd->dmabuf_bo, false,
 						&sfd->dmabuf_map_handle,
 						&sfd->dmabuf_map_stride);
-				if (!sfd->mem_local) {
+			} else {
+				/* CPU fallback: mmap the fd directly. A failed
+				 * attempt is retried on the next update cycle.
+				 * If the buffer could not be imported into GBM
+				 * and there is no CPU fallback either, nothing
+				 * can be transferred. */
+				if (!sfd->cpu_mapped) {
 					return;
 				}
+				sfd->mem_local = map_dmabuf_cpu(sfd->fd_local,
+						sfd->buffer_size,
+						sfd->dmabuf_info.strides[0],
+						&sfd->dmabuf_map_stride);
+			}
+			if (!sfd->mem_local) {
+				return;
 			}
 		}
 		if (first) {
@@ -1389,26 +1344,21 @@ void collect_update(struct thread_pool *threads, struct shadow_fd *sfd,
 			// ^ was not previously able to create buffer
 			return;
 		}
-		if (sfd->cpu_mapped && !sfd->mem_local) {
-			/* Retry the mmap that failed at translate_fd — the failure may
-			 * be transient, and gating WMSG_OPEN_DMAVID_DST below on a
-			 * usable buffer avoids advertising a phantom decode target. */
-			if (sfd->buffer_size > 0) {
-				void *m = mmap(NULL, sfd->buffer_size, PROT_READ,
-						MAP_SHARED, sfd->fd_local, 0);
-				if (m != MAP_FAILED) {
-					sfd->mem_local = m;
-					sfd->dmabuf_map_handle = NULL;
-					sfd->dmabuf_map_stride =
-							sfd->dmabuf_info.strides[0];
-				}
-			}
+		if (!sfd->dmabuf_bo && !sfd->mem_local) {
+			/* CPU fallback: ensure the fd is mapped. A failed
+			 * attempt is retried on the next update cycle; the
+			 * WMSG_OPEN_DMAVID_DST gating below keeps a failed
+			 * map from advertising a phantom decode target. */
+			sfd->mem_local = map_dmabuf_cpu(sfd->fd_local,
+					sfd->buffer_size,
+					sfd->dmabuf_info.strides[0],
+					&sfd->dmabuf_map_stride);
 		}
 		/* Only advertise the remote decode target once frames can
 		 * actually be produced; with the CPU fallback the mmap above
 		 * may still have failed, and a target that never receives
 		 * packets is worse than a delayed one. */
-		if (sfd->only_here && (!sfd->cpu_mapped || sfd->mem_local)) {
+		if (sfd->only_here && (sfd->dmabuf_bo || sfd->mem_local)) {
 			sfd->only_here = false;
 			if (use_old_dmavid_req) {
 				add_dmabuf_create_request(transfers, sfd,
