@@ -38,6 +38,22 @@
 #define DIAG_VIDEO_LOG(...) fprintf(stderr, "[gdwaypipe-diag] " __VA_ARGS__)
 #endif
 
+#ifdef __ANDROID__
+/* The GDExtension .so is loaded by Godot's Android Java layer via
+ * System.loadLibrary, so exporting JNI_OnLoad is the reliable way to capture
+ * the JavaVM for ffmpeg's MediaCodec decoders. JNI_GetCreatedJavaVMs is not
+ * used: the NDK sysroot has no libnativehelper, so the call would be an
+ * unresolved link. */
+#include <jni.h>
+static JavaVM *gdwaypipe_android_jvm = NULL;
+JNIEXPORT jint JNI_OnLoad(JavaVM *vm, void *reserved)
+{
+	(void)reserved;
+	gdwaypipe_android_jvm = vm;
+	return JNI_VERSION_1_6;
+}
+#endif
+
 #if !defined(HAS_VIDEO) || !defined(HAS_DMABUF)
 
 void setup_video_logging(void) {}
@@ -90,6 +106,9 @@ void apply_video_packet(struct shadow_fd *sfd, struct render_data *rd,
 #else /* HAS_VIDEO */
 
 #include <libavcodec/avcodec.h>
+#ifdef __ANDROID__
+#include <libavcodec/jni.h>
+#endif
 #include <libavutil/display.h>
 #include <libavutil/hwcontext_drm.h>
 #include <libavutil/imgutils.h>
@@ -115,6 +134,11 @@ void apply_video_packet(struct shadow_fd *sfd, struct render_data *rd,
  * gbm_android_format_supported() exposes that exact set to the capability
  * predicate below, so only mappable formats are advertised to peers. */
 #include <gbm.h>
+/* Android hardware decoders: ffmpeg's MediaCodec wrappers. They are
+ * hardware-only (no software fallback inside the decoder), which is why
+ * setup_video_decode re-looks-up the native decoder for the SW retry. */
+#define VIDEO_H264_HW_DECODER "h264_mediacodec"
+#define VIDEO_VP9_HW_DECODER "vp9_mediacodec"
 #endif
 
 #define VIDEO_H264_HW_ENCODER "h264_vaapi"
@@ -312,22 +336,32 @@ static const struct AVCodec *get_video_hw_encoder(
 }
 
 static const struct AVCodec *get_video_decoder(
-		enum video_coding_fmt fmt, bool print_error)
+		enum video_coding_fmt fmt, bool print_error, bool prefer_hw)
 {
 	const struct AVCodec *codec = NULL;
+	const char *name = NULL;
 	switch (fmt) {
 	case VIDEO_H264:
-		codec = avcodec_find_decoder_by_name(VIDEO_H264_DECODER);
+#ifdef __ANDROID__
+		name = prefer_hw ? VIDEO_H264_HW_DECODER : VIDEO_H264_DECODER;
+#else
+		(void)prefer_hw;
+		name = VIDEO_H264_DECODER;
+#endif
+		codec = avcodec_find_decoder_by_name(name);
 		if (!codec && print_error) {
-			wp_error("Failed to find decoder \"%s\"",
-					VIDEO_H264_DECODER);
+			wp_error("Failed to find decoder \"%s\"", name);
 		}
 		return codec;
 	case VIDEO_VP9:
-		codec = avcodec_find_decoder_by_name(VIDEO_VP9_DECODER);
+#ifdef __ANDROID__
+		name = prefer_hw ? VIDEO_VP9_HW_DECODER : VIDEO_VP9_DECODER;
+#else
+		name = VIDEO_VP9_DECODER;
+#endif
+		codec = avcodec_find_decoder_by_name(name);
 		if (!codec && print_error) {
-			wp_error("Failed to find decoder \"%s\"",
-					VIDEO_VP9_DECODER);
+			wp_error("Failed to find decoder \"%s\"", name);
 		}
 		return codec;
 	case VIDEO_AV1:
@@ -345,7 +379,7 @@ static const struct AVCodec *get_video_decoder(
 bool video_supports_coding_format(enum video_coding_fmt fmt)
 {
 	return get_video_sw_encoder(fmt, false) &&
-	       get_video_decoder(fmt, false);
+	       get_video_decoder(fmt, false, false);
 }
 
 static void video_log_callback(
@@ -664,15 +698,44 @@ static bool pad_hardware_size(
 static int init_hwcontext(struct render_data *rd)
 {
 #ifdef __ANDROID__
-	/* Android has no /dev/dri render node and no VAAPI; the
-	 * AHardwareBuffer-backed GBM shim allocates decode targets without
-	 * any hardware device context. Forcing the software path here makes
-	 * setup_video_decode's existing "HW-decode fallback to software"
-	 * logic take the software branch deterministically (has_hw = false),
-	 * instead of attempting an AV_DRM device with fd -1 and failing with
-	 * misleading error logs. */
-	rd->av_disabled = true;
-	return -1;
+	/* Android has no /dev/dri render node and no VAAPI; hardware decode
+	 * runs through ffmpeg's MediaCodec decoders. If hardware video was
+	 * disabled at startup, take the software branch deterministically
+	 * (has_hw = false) as before. */
+	if (rd->av_disabled) {
+		return -1;
+	}
+	if (rd->av_hwdevice_ref != NULL) {
+		return 0;
+	}
+	/* The JavaVM captured by JNI_OnLoad must be handed to ffmpeg before
+	 * any MediaCodec decoder is opened; without it decoder init fails.
+	 * The JVM can only be set once, so a repeated registration with the
+	 * same VM (AVERROR(EEXIST)) counts as success too. */
+	if (gdwaypipe_android_jvm) {
+		int jerr = av_jni_set_java_vm(gdwaypipe_android_jvm, NULL);
+		if (jerr < 0 && jerr != AVERROR(EEXIST)) {
+			wp_error("Failed to register Android JVM with ffmpeg: %s",
+					av_err2str(jerr));
+			rd->av_disabled = true;
+			return -1;
+		}
+	} else {
+		wp_debug("Android JVM not captured (JNI_OnLoad not called); "
+			 "using software decode");
+		rd->av_disabled = true;
+		return -1;
+	}
+	/* A surface-less MediaCodec device runs the decoders in ByteBuffer
+	 * mode, so decoded frames come out as plain CPU frames (NV12) and
+	 * the existing sws_scale path applies directly. */
+	if (av_hwdevice_ctx_create(&rd->av_hwdevice_ref,
+			AV_HWDEVICE_TYPE_MEDIACODEC, NULL, NULL, 0) < 0) {
+		wp_error("Failed to create MediaCodec hardware device");
+		rd->av_disabled = true;
+		return -1;
+	}
+	return 0;
 #else
 	if (rd->av_disabled) {
 		return -1;
@@ -1158,13 +1221,20 @@ static enum AVPixelFormat get_decode_format(
 	(void)ctx;
 	for (const enum AVPixelFormat *p = pix_fmts; *p != AV_PIX_FMT_NONE;
 			p++) {
+#ifdef __ANDROID__
+		/* Prefer MediaCodec output, if available. */
+		if (*p == AV_PIX_FMT_MEDIACODEC) {
+			return AV_PIX_FMT_MEDIACODEC;
+		}
+#else
 		/* Prefer VAAPI output, if available. */
 		if (*p == AV_PIX_FMT_VAAPI) {
 			return AV_PIX_FMT_VAAPI;
 		}
+#endif
 	}
 	/* YUV420P is the typical software option, but this function is only
-	 * called when VAAPI is already available */
+	 * called when a hardware pixel format was requested */
 	return AV_PIX_FMT_NONE;
 }
 
@@ -1197,7 +1267,8 @@ int setup_video_decode(struct shadow_fd *sfd, struct render_data *rd)
 		return -1;
 	}
 
-	const struct AVCodec *codec = get_video_decoder(sfd->video_fmt, true);
+	const struct AVCodec *codec =
+			get_video_decoder(sfd->video_fmt, true, has_hw);
 	if (!codec) {
 		return -1;
 	}
@@ -1208,13 +1279,19 @@ int setup_video_decode(struct shadow_fd *sfd, struct render_data *rd)
 	 * skipped rather than attempted and failed. */
 	bool hw_supported = false;
 	if (has_hw) {
+#ifdef __ANDROID__
+		const enum AVHWDeviceType hwdev_type =
+				AV_HWDEVICE_TYPE_MEDIACODEC;
+#else
+		const enum AVHWDeviceType hwdev_type = AV_HWDEVICE_TYPE_VAAPI;
+#endif
 		for (int i = 0;; i++) {
 			const AVCodecHWConfig *cfg =
 					avcodec_get_hw_config(codec, i);
 			if (!cfg) {
 				break;
 			}
-			if (cfg->device_type == AV_HWDEVICE_TYPE_VAAPI &&
+			if (cfg->device_type == hwdev_type &&
 					(cfg->methods &
 							AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX)) {
 				hw_supported = true;
@@ -1268,12 +1345,20 @@ int setup_video_decode(struct shadow_fd *sfd, struct render_data *rd)
 	if (open_err < 0) {
 		if (has_hw && hw_supported) {
 			/* The HW-configured context failed to open (e.g. no
-			 * registered VAAPI hw_config, or get_format could not
+			 * registered hardware hw_config, or get_format could not
 			 * obtain a surface). Retry once with a fresh software
 			 * context instead of hard-failing. */
 			wp_debug("HW decode open failed for RID=%d (%s); retrying in software",
 					sfd->remote_id, av_err2str(open_err));
 			avcodec_free_context(&ctx);
+			/* The mediacodec decoders are hardware-only, so a fresh
+			 * lookup of the native decoder is required for the
+			 * software retry (on VAAPI this resolves to the same
+			 * codec as before). */
+			codec = get_video_decoder(sfd->video_fmt, false, false);
+			if (!codec) {
+				return -1;
+			}
 			ctx = avcodec_alloc_context3(codec);
 			if (!ctx) {
 				wp_error("Failed to allocate context");
@@ -1328,9 +1413,9 @@ int setup_video_decode(struct shadow_fd *sfd, struct render_data *rd)
 	/* will be allocated on frame receipt */
 	sfd->video_local_frame = NULL;
 	sfd->video_color_context = NULL;
-	DIAG_VIDEO_LOG("[decode-setup] ok ctx=%dx%d drm_fmt=0x%x av_fmt=%d (sw path)\n",
+	DIAG_VIDEO_LOG("[decode-setup] ok ctx=%dx%d drm_fmt=0x%x av_fmt=%d hw=%d\n",
 			ctx->width, ctx->height, sfd->dmabuf_info.format,
-			ctx->pix_fmt);
+			ctx->pix_fmt, ctx->hw_device_ctx != NULL);
 	return 0;
 }
 
@@ -1577,7 +1662,9 @@ void apply_video_packet(struct shadow_fd *sfd, struct render_data *rd,
 			(void)rd;
 #endif
 
-			if (sfd->video_yuv_frame->format == AV_PIX_FMT_VAAPI) {
+			if (sfd->video_yuv_frame->format == AV_PIX_FMT_VAAPI ||
+					sfd->video_yuv_frame->format ==
+							AV_PIX_FMT_MEDIACODEC) {
 				if (!sfd->video_tmp_frame) {
 					sfd->video_tmp_frame = av_frame_alloc();
 					if (!sfd->video_tmp_frame) {
