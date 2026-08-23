@@ -454,6 +454,35 @@ int unmap_dmabuf(struct gbm_bo *bo, void *map_handle)
 	gbm_bo_unmap(bo, map_handle);
 	return 0;
 }
+/* B5: DMA_BUF_IOCTL_SYNC brackets every CPU write into a dma-buf so the
+ * implicit fence orders the write against the compositor's GPU sampling.
+ * The ioctl is a no-op-adjacent ENOTTY on non-dma-buf fds (e.g. the CPU
+ * fallback path), which is logged at debug level rather than failing the
+ * write. */
+static int dmabuf_sync_ioctl(int fd, bool write, bool end)
+{
+	struct dma_buf_sync sync = {
+			.flags = (end ? DMA_BUF_SYNC_END : DMA_BUF_SYNC_START) |
+				 (write ? DMA_BUF_SYNC_WRITE : DMA_BUF_SYNC_READ)};
+	if (ioctl(fd, DMA_BUF_IOCTL_SYNC, &sync) == -1) {
+		if (errno != ENOTTY && errno != EINVAL) {
+			wp_error("DMA_BUF_IOCTL_SYNC %s %s failed on fd %d: %s",
+					end ? "END" : "START",
+					write ? "WRITE" : "READ", fd,
+					strerror(errno));
+		}
+		return -1;
+	}
+	return 0;
+}
+int dmabuf_sync_start(int fd, bool write)
+{
+	return dmabuf_sync_ioctl(fd, write, false);
+}
+int dmabuf_sync_end(int fd, bool write)
+{
+	return dmabuf_sync_ioctl(fd, write, true);
+}
 
 // TODO: support DRM formats, like DRM_FORMAT_RGB888_A8 and
 // DRM_FORMAT_ARGB16161616F, defined in drm_fourcc.h.

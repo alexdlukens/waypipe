@@ -30,6 +30,24 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include <sys/ioctl.h>
+
+/* B5: DMA_BUF_IOCTL_SYNC is required around CPU access to a dma-buf so the
+ * implicit fence orders CPU writes against the GPU sampling the buffer.
+ * <linux/dma-buf.h> is not part of this build's include set, so define the
+ * ioctl locally (same ABI as the kernel definition); the guard keeps the
+ * kernel header's definitions when it happens to be included first. */
+#ifndef DMA_BUF_IOCTL_SYNC
+struct dma_buf_sync {
+	uint64_t flags;
+};
+#define DMA_BUF_BASE 'b'
+#define DMA_BUF_IOCTL_SYNC _IOW(DMA_BUF_BASE, 0, struct dma_buf_sync)
+#define DMA_BUF_SYNC_START 0
+#define DMA_BUF_SYNC_END (1 << 2)
+#define DMA_BUF_SYNC_WRITE (2 << 0)
+#define DMA_BUF_SYNC_READ (1 << 0)
+#endif
 typedef void *VADisplay;
 typedef unsigned int VAGenericID;
 typedef VAGenericID VAConfigID;
@@ -87,6 +105,10 @@ void destroy_dmabuf(struct gbm_bo *bo);
 void *map_dmabuf(struct gbm_bo *bo, bool write, void **map_handle,
 		uint32_t *exp_stride);
 int unmap_dmabuf(struct gbm_bo *bo, void *map_handle);
+/** Begin/end a DMA_BUF_IOCTL_SYNC critical section on a dma-buf fd around a
+ * CPU map/write/unmap of the buffer. */
+int dmabuf_sync_start(int fd, bool write);
+int dmabuf_sync_end(int fd, bool write);
 /** CPU-fallback variant of map_dmabuf: mmap the fd that backs a DMABUF which
  * could not be imported into GBM (import_dmabuf with cpu_dmabuf_fallback).
  * The mapping persists until the buffer is destroyed (there is no matching

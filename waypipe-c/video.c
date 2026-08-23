@@ -1678,15 +1678,22 @@ void apply_video_packet(struct shadow_fd *sfd, struct render_data *rd,
 			/* Copy data onto DMABUF */
 			uint32_t map_stride = 0;
 			void *handle = NULL;
+			/* B5: this is a CPU write into the dma-buf; bracket it
+			 * with DMA_BUF_IOCTL_SYNC so the implicit fence orders
+			 * the write against the compositor sampling the buffer
+			 * (without it the surface can render stale/white). */
+			dmabuf_sync_start(sfd->fd_local, true);
 			void *data = map_dmabuf(sfd->dmabuf_bo, true, &handle,
 					&map_stride);
 			if (!data) {
+				dmabuf_sync_end(sfd->fd_local, true);
 				return;
 			}
 			copy_from_video_mirror(data, map_stride,
 					sfd->video_local_frame,
 					&sfd->dmabuf_info);
 			unmap_dmabuf(sfd->dmabuf_bo, handle);
+			dmabuf_sync_end(sfd->fd_local, true);
 		} else {
 			if (recvstat != AVERROR(EAGAIN)) {
 				wp_error("Failed to receive frame due to error: %s",

@@ -111,7 +111,16 @@ static void destroy_unlinked_sfd(struct shadow_fd *sfd)
 		free(sfd->pipe.send.data);
 	}
 	if (sfd->fd_local != -1) {
-		checked_close(sfd->fd_local);
+		/* A2: exactly-once close discipline. The fd table is shared
+		 * with the compositor, so a stale fd_local number must never
+		 * be closed twice: EBADF here means the number was already
+		 * released (double-close). */
+		if (close(sfd->fd_local) == -1) {
+			wp_error("close(%d) failed while destroying %s RID=%d: %s",
+					sfd->fd_local, fdcat_to_str(sfd->type),
+					sfd->remote_id, strerror(errno));
+		}
+		sfd->fd_local = -1;
 	}
 	free(sfd);
 }
@@ -1595,6 +1604,38 @@ static int check_sfd_type(struct shadow_fd *sfd, int remote_id,
 	return check_sfd_type_2(sfd, remote_id, mtype, ftype, ftype);
 }
 
+/* C1: zero a freshly created dmabuf target so the first commit never samples
+ * uninitialized GTT memory (observed as solid white/black surfaces before the
+ * first decoded frame arrives). The memset is itself a CPU write, so it is
+ * bracketed by the B5 DMA_BUF_IOCTL_SYNC section. */
+static void zero_dmabuf_target(struct shadow_fd *sfd)
+{
+	if (!sfd->dmabuf_bo || sfd->fd_local == -1) {
+		return;
+	}
+	uint32_t map_stride = 0;
+	void *handle = NULL;
+	dmabuf_sync_start(sfd->fd_local, true);
+	void *data = map_dmabuf(sfd->dmabuf_bo, true, &handle, &map_stride);
+	if (!data) {
+		dmabuf_sync_end(sfd->fd_local, true);
+		wp_error("Failed to map freshly created dmabuf target for RID=%d for zeroing",
+				sfd->remote_id);
+		return;
+	}
+	/* Zero at least the wire-declared buffer size, without exceeding the
+	 * driver-aligned mapping. */
+	size_t map_bytes = (size_t)sfd->dmabuf_info.height * map_stride;
+	size_t zero_bytes = sfd->buffer_size > 0
+					? minu(sfd->buffer_size, map_bytes)
+					: map_bytes;
+	if (zero_bytes > 0) {
+		memset(data, 0, zero_bytes);
+	}
+	unmap_dmabuf(sfd->dmabuf_bo, handle);
+	dmabuf_sync_end(sfd->fd_local, true);
+}
+
 int apply_update(struct fd_translation_map *map, struct thread_pool *threads,
 		struct render_data *render, enum wmsg_type type, int remote_id,
 		const struct bytebuf *msg)
@@ -1722,6 +1763,9 @@ int apply_update(struct fd_translation_map *map, struct thread_pool *threads,
 			return 0;
 		}
 		sfd->fd_local = export_dmabuf(sfd->dmabuf_bo);
+		/* C1: the freshly created dmabuf is uninitialized GTT memory;
+		 * zero it so the first commit cannot sample garbage. */
+		zero_dmabuf_target(sfd);
 
 		return 0;
 	}
@@ -1802,6 +1846,8 @@ int apply_update(struct fd_translation_map *map, struct thread_pool *threads,
 			return 0;
 		}
 		sfd->fd_local = export_dmabuf(sfd->dmabuf_bo);
+		/* C1: zero the fresh decode target (see WMSG_OPEN_DMAVID_DST). */
+		zero_dmabuf_target(sfd);
 
 		if (setup_video_decode(sfd, render) == -1) {
 			wp_error("Video decoding setup failed for RID=%d",
@@ -1884,6 +1930,8 @@ int apply_update(struct fd_translation_map *map, struct thread_pool *threads,
 			return 0;
 		}
 		sfd->fd_local = export_dmabuf(sfd->dmabuf_bo);
+		/* C1: zero the fresh target (see WMSG_OPEN_DMAVID_DST). */
+		zero_dmabuf_target(sfd);
 
 		if (setup_video_encode(sfd, render, threads->nthreads) == -1) {
 			wp_error("Video encoding setup failed for RID=%d",
@@ -2038,11 +2086,14 @@ int apply_update(struct fd_translation_map *map, struct thread_pool *threads,
 
 			void *handle = NULL;
 			uint32_t map_stride = 0;
+			/* B5: CPU write into the dma-buf; sync the implicit fence. */
+			dmabuf_sync_start(sfd->fd_local, true);
 			char *mem_local = map_dmabuf(sfd->dmabuf_bo, true,
 					&handle, &map_stride);
 			if (!mem_local) {
 				wp_error("Failed to apply fill to RID=%d, fd not mapped",
 						sfd->remote_id);
+				dmabuf_sync_end(sfd->fd_local, true);
 				return 0;
 			}
 			uint32_t in_stride = sfd->dmabuf_info.strides[0];
@@ -2067,8 +2118,10 @@ int apply_update(struct fd_translation_map *map, struct thread_pool *threads,
 			}
 
 			if (unmap_dmabuf(sfd->dmabuf_bo, handle) == -1) {
+				dmabuf_sync_end(sfd->fd_local, true);
 				return 0;
 			}
+			dmabuf_sync_end(sfd->fd_local, true);
 		} else {
 			memcpy(sfd->mem_mirror + header->start, act_buffer,
 					header->end - header->start);
@@ -2131,11 +2184,14 @@ int apply_update(struct fd_translation_map *map, struct thread_pool *threads,
 
 			void *handle = NULL;
 			uint32_t map_stride = 0;
+			/* B5: CPU write into the dma-buf; sync the implicit fence. */
+			dmabuf_sync_start(sfd->fd_local, true);
 			char *mem_local = map_dmabuf(sfd->dmabuf_bo, true,
 					&handle, &map_stride);
 			if (!mem_local) {
 				wp_error("Failed to apply diff to RID=%d, fd not mapped",
 						sfd->remote_id);
+				dmabuf_sync_end(sfd->fd_local, true);
 				return 0;
 			}
 			uint32_t in_stride = sfd->dmabuf_info.strides[0];
@@ -2189,8 +2245,10 @@ int apply_update(struct fd_translation_map *map, struct thread_pool *threads,
 			}
 
 			if (unmap_dmabuf(sfd->dmabuf_bo, handle) == -1) {
+				dmabuf_sync_end(sfd->fd_local, true);
 				return 0;
 			}
+			dmabuf_sync_end(sfd->fd_local, true);
 		} else {
 			DTRACE_PROBE2(waypipe, apply_diff_enter,
 					sfd->buffer_size, header->diff_size);
@@ -2310,9 +2368,26 @@ bool shadow_decref_transfer(struct shadow_fd *sfd)
 		 * it and make it match pipe.fd, just as on the side where
 		 * the original pipe was introduced */
 		if (sfd->pipe.fd != sfd->fd_local) {
-			checked_close(sfd->fd_local);
+			/* A2: exactly-once close; EBADF here means the number was
+			 * already released elsewhere (double-close). */
+			if (close(sfd->fd_local) == -1) {
+				wp_error("close(%d) failed while decrefing %s RID=%d: %s",
+						sfd->fd_local, fdcat_to_str(sfd->type),
+						sfd->remote_id, strerror(errno));
+			}
+			sfd->fd_local = -1;
 			sfd->fd_local = sfd->pipe.fd;
 		}
+	}
+	/* A video source/target (FDC_DMAVID_*) is a long-lived encode/decode
+	 * surface: the remote keeps its rid alive for the whole buffer
+	 * lifetime, re-committing the same target for every frame, so the
+	 * transfer refcount (which only counts fd handoffs to the
+	 * compositor) must never destroy the shadow and its fd_local. It is
+	 * released when the remote destroys the rid, i.e. when the protocol
+	 * reference is dropped (shadow_decref_protocol). */
+	if (sfd->type == FDC_DMAVID_IR || sfd->type == FDC_DMAVID_IW) {
+		return false;
 	}
 	return destroy_shadow_if_unreferenced(sfd);
 }

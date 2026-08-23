@@ -71,6 +71,11 @@ struct obj_wl_buffer {
 	uint32_t dmabuf_strides[MAX_DMABUF_PLANES];
 	uint64_t dmabuf_modifiers[MAX_DMABUF_PLANES];
 
+	/* A1: set when this buffer's create_immed was suppressed (a garbage
+	 * fd was added); the compositor never created the object, so later
+	 * attaches of it are dropped (see do_wl_surface_req_attach). */
+	bool create_suppressed;
+
 	uint64_t unique_id;
 };
 
@@ -142,6 +147,10 @@ struct obj_zwp_linux_dmabuf_params {
 		uint64_t modifier;
 	} add[MAX_DMABUF_PLANES];
 	int nplanes;
+	/* A1: set when a garbage fd (fstat-fail / size==0) was added; the
+	 * create/create_immed for this params object is then suppressed so the
+	 * compositor never receives a buffer built from it. */
+	bool rejected;
 };
 
 struct format_table_entry {
@@ -243,16 +252,25 @@ static const struct wp_interface *const non_global_interfaces[] = {
 
 static void cleanup_dmabuf_params_fds(struct obj_zwp_linux_dmabuf_params *r)
 {
-	// Sometimes multiple entries point to the same buffer
+	/* Ownership rule: once do_zwp_linux_buffer_params_v1_req_create has
+	 * run translate_fd() on a plane fd, that number is the shadow_fd's
+	 * (r->add[i].buffer != NULL) and the shadow closes it exactly once
+	 * at its own destruction (destroy_unlinked_sfd). Closing it here
+	 * leaves a live sfd->fd_local stale; in the in-process decoder the
+	 * freed number is recycled from the shared fd table into live
+	 * wlr_buffer dmabuf fds, and the shadow's later close() silently
+	 * kills a zero-copy texture (observed as EBADF re-imports with the
+	 * number reused by /dev/dri/renderD128). So close only fds this
+	 * object still owns (planes whose create never adopted them). */
 	for (int i = 0; i < MAX_DMABUF_PLANES; i++) {
 		int fd = r->add[i].fd;
-		if (fd != -1) {
-			checked_close(fd);
-
-			for (int k = 0; k < MAX_DMABUF_PLANES; k++) {
-				if (fd == r->add[k].fd) {
-					r->add[k].fd = -1;
-				}
+		if (fd == -1 || r->add[i].buffer != NULL) {
+			continue;
+		}
+		checked_close(fd);
+		for (int k = 0; k < MAX_DMABUF_PLANES; k++) {
+			if (r->add[k].fd == fd && r->add[k].buffer == NULL) {
+				r->add[k].fd = -1;
 			}
 		}
 	}
@@ -737,6 +755,14 @@ void do_wl_surface_req_attach(struct context *ctx, struct wp_object *buffer,
 	}
 	if (bufobj->type != &intf_wl_buffer) {
 		wp_error("Buffer to be attached has the wrong type");
+		return;
+	}
+	if (((struct obj_wl_buffer *)bufobj)->create_suppressed) {
+		/* A1: this wl_buffer's create_immed was suppressed (a garbage
+		 * fd was added), so the compositor never created the object;
+		 * drop the attach to keep the compositor from erroring on an
+		 * attach of a nonexistent buffer. */
+		ctx->drop_this_msg = true;
 		return;
 	}
 	struct obj_wl_surface *surface = (struct obj_wl_surface *)ctx->obj;
@@ -1400,21 +1426,48 @@ void do_zwp_linux_buffer_params_v1_evt_created(
 		buf->dmabuf_offsets[i] = params->add[i].offset;
 		buf->dmabuf_strides[i] = params->add[i].stride;
 		buf->dmabuf_modifiers[i] = params->add[i].modifier;
-		params->add[i].buffer = NULL;
+		/* Keep add[i].buffer set for cleanup_dmabuf_params_fds:
+		 * a non-NULL shadow means the fd number belongs to the
+		 * shadow now and must NOT be closed here. The pointers are
+		 * cleared right after cleanup. */
 	}
 	cleanup_dmabuf_params_fds(params);
+	for (int i = 0; i < MAX_DMABUF_PLANES; i++) {
+		params->add[i].buffer = NULL;
+	}
 	buf->dmabuf_flags = params->create_flags;
 	buf->dmabuf_width = params->create_width;
 	buf->dmabuf_height = params->create_height;
 	buf->dmabuf_format = params->create_format;
 	buf->unique_id = ctx->g->tracker.buffer_seqno++;
 }
+
 void do_zwp_linux_buffer_params_v1_req_add(struct context *ctx, int fd,
 		uint32_t plane_idx, uint32_t offset, uint32_t stride,
 		uint32_t modifier_hi, uint32_t modifier_lo)
 {
 	struct obj_zwp_linux_dmabuf_params *params =
 			(struct obj_zwp_linux_dmabuf_params *)ctx->obj;
+	/* A1: validate the incoming fd before accepting it. In the in-process
+	 * decoder the compositor shares this process's fd table, so a garbage
+	 * (already-closed/reused) fd or a non-dmabuf fd (fstat size==0, e.g. a
+	 * render node) must never reach the compositor: importing it poisons
+	 * the buffer and kills the client connection. */
+	struct stat st;
+	int fstat_ret = fstat(fd, &st);
+	if (fstat_ret == -1 || st.st_size == 0) {
+		wp_error("Rejecting zwp_linux_buffer_params_v1.add fd=%d: %s (size=%lld) is not a valid dmabuf",
+				fd,
+				fstat_ret == -1 ? strerror(errno) : "fstat ok",
+				fstat_ret == -1 ? -1LL : (long long)st.st_size);
+		/* Close our copy of the garbage fd (the shadow never took
+		 * ownership of it), mark the params object rejected, and drop
+		 * the add so neither it nor the later create is forwarded. */
+		checked_close(fd);
+		params->rejected = true;
+		ctx->drop_this_msg = true;
+		return;
+	}
 	if (params->nplanes != (int)plane_idx) {
 		wp_error("Expected sequentially assigned plane fds: got new_idx=%d != %d=nplanes",
 				plane_idx, params->nplanes);
@@ -1465,6 +1518,14 @@ void do_zwp_linux_buffer_params_v1_req_create(struct context *ctx,
 {
 	struct obj_zwp_linux_dmabuf_params *params =
 			(struct obj_zwp_linux_dmabuf_params *)ctx->obj;
+	/* A1: a garbage fd was added to this params object; suppress the
+	 * buffer creation so the compositor never receives a buffer built
+	 * from it and the client connection is not killed by a failed
+	 * create_immed. */
+	if (params->rejected) {
+		ctx->drop_this_msg = true;
+		return;
+	}
 	params->create_flags = flags;
 	params->create_width = width;
 	params->create_height = height;
@@ -1559,6 +1620,10 @@ void do_zwp_linux_buffer_params_v1_req_create(struct context *ctx,
 				ctx->fds->data + ctx->fds->zone_start,
 				(size_t)nmoved * sizeof(int));
 		for (int i = 0; i < params->nplanes; i++) {
+			/* The fd travels to the compositor via the transfer queue
+			 * (see A3 in mainloop.c advance_chanmsg_progwrite), which
+			 * dups it so the compositor's number is exclusive; the raw
+			 * number is kept here only for the parser's fd queue. */
 			ctx->fds->data[ctx->fds->zone_start + i] =
 					params->add[i].fd;
 		}
@@ -1618,6 +1683,23 @@ void do_zwp_linux_buffer_params_v1_req_create_immed(struct context *ctx,
 		struct wp_object *buffer_id, int32_t width, int32_t height,
 		uint32_t format, uint32_t flags)
 {
+	struct obj_zwp_linux_dmabuf_params *params =
+			(struct obj_zwp_linux_dmabuf_params *)ctx->obj;
+	if (params->rejected) {
+		/* A1: garbage fd was added; do not forward the create_immed and
+		 * do not fabricate a display-side buffer object for a buffer
+		 * the compositor will never create. */
+		ctx->drop_this_msg = true;
+		/* The tracker already holds the (empty) wl_buffer object for
+		 * this id; mark it so later attaches of it are dropped too,
+		 * since the compositor never created the object and would
+		 * error on an attach of a nonexistent buffer. */
+		if (buffer_id) {
+			((struct obj_wl_buffer *)buffer_id)
+					->create_suppressed = true;
+		}
+		return;
+	}
 	// There isn't really that much unnecessary copying. Note that
 	// 'create' may modify messages
 	do_zwp_linux_buffer_params_v1_req_create(

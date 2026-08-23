@@ -143,6 +143,7 @@ static int translate_fds(struct fd_translation_map *map,
 {
 	(void)render;
 	(void)threads;
+	int nout = 0;
 	for (int i = 0; i < nfds; i++) {
 		struct shadow_fd *sfd = get_shadow_for_local_fd(map, fds[i]);
 		if (!sfd) {
@@ -150,31 +151,36 @@ static int translate_fds(struct fd_translation_map *map,
 			 * a shadow for every fd the protocol parser consumed before
 			 * collect_update() ran, so that each id referenced by
 			 * WMSG_INJECT_RIDS has its content transfer queued in the
-			 * same channel batch. Creating a shadow here would be too
-			 * late: the transfer would be missing and the peer would be
-			 * unable to untranslate the id. Abort instead. */
-			wp_error("No shadow registered for fd %d before collect_update; aborting channel",
+			 * same channel batch. A missing shadow means the fd is
+			 * stale (its shadow was destroyed): log and skip the id
+			 * instead of aborting the channel, so a garbage fd cannot
+			 * kill the session. */
+			wp_error("No shadow registered for fd %d; skipping it",
 					fds[i]);
-			return -1;
+			continue;
 		}
-		ids[i] = sfd->remote_id;
+		ids[nout++] = sfd->remote_id;
 	}
-	return 0;
+	return nout;
 }
 /** Given a list of global ids, and an up-to-date translation map, produce local
- * file descriptors. Returns 0 on success, -1 if any id is not present in the
- * map; the caller must abort the channel in that case, because writing a
- * poisoned fd (-1) into the local program's stream would crash the
- * application instead. */
+ * file descriptors. A missing id is logged and replaced with -1 (poisoned)
+ * rather than failing: the fd consumers downstream (fstat/A1 validation, dup)
+ * treat -1 as garbage and drop the affected messages, so the channel survives
+ * stale ids instead of aborting. */
 static int untranslate_ids(struct fd_translation_map *map, int nids,
 		const int *ids, int *fds)
 {
 	for (int i = 0; i < nids; i++) {
 		struct shadow_fd *shadow = get_shadow_for_rid(map, ids[i]);
 		if (!shadow) {
-			wp_error("Could not untranslate remote id %d in map; aborting channel instead of poisoning the application",
+			/* A transiently missing shadow (e.g. a video target the
+			 * remote recycled) must not abort the channel: log and
+			 * substitute -1, which the fd consumers drop gracefully. */
+			wp_error("Could not untranslate remote id %d in map; skipping it",
 					ids[i]);
-			return -1;
+			fds[i] = -1;
+			continue;
 		}
 		fds[i] = shadow->fd_local;
 	}
@@ -332,11 +338,32 @@ static int interpret_chanmsg(struct chan_msg_state *cmsg,
 				return ERR_NOMEM;
 			}
 
-			// Append the new file descriptors to the parsing queue
+			// Append the new file descriptors (INCLUDING any -1
+			// poisons) to the parsing queue: the parser needs the
+			// -1 so A1 can identify and drop the offending message
+			// together with its fd.
 			memcpy(cmsg->proto_fds.data + cmsg->proto_fds.zone_end,
 					cmsg->transf_fds.data,
 					sizeof(int) * (size_t)nfds);
 			cmsg->proto_fds.zone_end += nfds;
+		}
+		/* Compact the poisons out of the TRANSFER queue: at write time
+		 * dup(-1) would abort the whole remaining protocol batch and
+		 * leak every valid fd's transfer ref. The poisoned message's
+		 * bytes were already excised by the parser (drop_this_msg), so
+		 * removing its fd here keeps the queue aligned with the
+		 * surviving protocol data. */
+		int nkept = 0;
+		for (int i = 0; i < nfds; i++) {
+			if (cmsg->transf_fds.data[i] != -1) {
+				cmsg->transf_fds.data[nkept++] =
+						cmsg->transf_fds.data[i];
+			}
+		}
+		if (nkept != nfds) {
+			wp_debug("Dropped %d untranslatable fd(s) from transfer queue",
+					nfds - nkept);
+			cmsg->transf_fds.zone_end = nkept;
 		}
 		return 0;
 	} else if (type == WMSG_PROTOCOL) {
@@ -549,14 +576,66 @@ static int advance_chanmsg_progwrite(struct chan_msg_state *cmsg, int progfd,
 	const char *progdesc = display_side ? "compositor" : "application";
 	// Write as much as possible
 	while (cmsg->proto_write.zone_start < cmsg->proto_write.zone_end) {
+		/* A3: on the display side the compositor shares this process's
+		 * fd table, so handing it the raw shadow fd numbers lets a
+		 * shadow destroy free a number the compositor still holds
+		 * (observed as EBADF re-imports and render-node fd reuse under
+		 * the compositor). Hand the compositor dup'd copies instead:
+		 * each shadow keeps fd_local and closes it exactly once at
+		 * destroy, so the compositor's number is exclusively its own.
+		 * The dup'd intermediates are closed right after the write;
+		 * the peer owns the copies it receives. */
+		int nfds = cmsg->transf_fds.zone_end -
+				cmsg->transf_fds.zone_start;
+		int *dup_fds = NULL;
+		if (display_side && nfds > 0) {
+			dup_fds = calloc((size_t)nfds, sizeof(int));
+			if (!dup_fds) {
+				wp_error("Allocation failure for fd dup queue, expect a crash");
+				return ERR_NOMEM;
+			}
+			for (int i = 0; i < nfds; i++) {
+				int orig = cmsg->transf_fds
+						   .data[cmsg->transf_fds.zone_start + i];
+				dup_fds[i] = dup(orig);
+				if (dup_fds[i] == -1) {
+					wp_error("Failed to dup fd %d for the compositor: %s",
+							orig, strerror(errno));
+					for (int j = 0; j < i; j++) {
+						checked_close(dup_fds[j]);
+					}
+					free(dup_fds);
+					/* A3: a stale fd (its shadow was already
+					 * destroyed, e.g. at a resize) must never abort
+					 * the decoder: log, drop the whole message, and
+					 * continue. The fds are skipped without touching
+					 * refcounts, because a closed number is no longer
+					 * owned by any shadow (and could already belong to
+					 * a new one). */
+					cmsg->transf_fds.zone_start =
+							cmsg->transf_fds.zone_end;
+					cmsg->proto_write.zone_start =
+							cmsg->proto_write.zone_end;
+					cmsg->state = CM_WAITING_FOR_CHANNEL;
+					DTRACE_PROBE(waypipe, chanmsg_channel_wait);
+					return 0;
+				}
+			}
+		}
 		ssize_t wc = iovec_write(progfd,
 				cmsg->proto_write.data +
 						cmsg->proto_write.zone_start,
 				(size_t)(cmsg->proto_write.zone_end -
 						cmsg->proto_write.zone_start),
-				cmsg->transf_fds.data,
-				cmsg->transf_fds.zone_end,
+				dup_fds ? dup_fds : cmsg->transf_fds.data,
+				dup_fds ? nfds : cmsg->transf_fds.zone_end,
 				&cmsg->transf_fds.zone_start);
+		if (dup_fds) {
+			for (int i = 0; i < nfds; i++) {
+				checked_close(dup_fds[i]);
+			}
+			free(dup_fds);
+		}
 		if (wc == -1 && (errno == EWOULDBLOCK || errno == EAGAIN)) {
 			wp_debug("Write to the %s would block", progdesc);
 			return 0;
@@ -1014,15 +1093,22 @@ static int advance_waymsg_progread(struct way_msg_state *wmsg,
 			msg[0] = transfer_header(act_size, WMSG_INJECT_RIDS);
 			int32_t *rbuffer = (int32_t *)(msg + 1);
 
-			/* Translate and adjust refcounts */
-			if (translate_fds(&g->map, &g->render, &g->threads,
-					    wmsg->fds.zone_start,
-					    wmsg->fds.data, rbuffer) == -1) {
+			/* Translate and adjust refcounts. translate_fds() skips
+			 * (and logs) fds whose shadow is missing and returns the
+			 * number of ids actually translated, so a stale fd
+			 * shrinks the INJECT_RIDS message instead of aborting
+			 * the channel. */
+			int ntranslated = translate_fds(&g->map, &g->render,
+					&g->threads, wmsg->fds.zone_start,
+					wmsg->fds.data, rbuffer);
+			if (ntranslated < 0) {
 				free(msg);
 				return ERR_FATAL;
 			}
-			decref_transferred_rids(
-					&g->map, wmsg->fds.zone_start, rbuffer);
+			act_size = (size_t)ntranslated * sizeof(int32_t) +
+					sizeof(uint32_t);
+			msg[0] = transfer_header(act_size, WMSG_INJECT_RIDS);
+			decref_transferred_rids(&g->map, ntranslated, rbuffer);
 			memmove(wmsg->fds.data,
 					wmsg->fds.data + wmsg->fds.zone_start,
 					sizeof(int) * (size_t)(wmsg->fds.zone_end -
