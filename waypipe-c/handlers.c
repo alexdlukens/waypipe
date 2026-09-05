@@ -1338,10 +1338,16 @@ void do_wl_drm_req_create_prime_buffer(struct context *ctx,
 	buf->dmabuf_strides[0] = (uint32_t)stride0;
 	buf->unique_id = ctx->g->tracker.buffer_seqno++;
 
-	if (ctx->on_display_side) {
+	if (ctx->on_display_side && sfd->dmabuf_bo != NULL) {
 		/* the new dmabuf being created is not guaranteed to
 		 * have the original offset/stride parameters, so reset
-		 * them */
+		 * them. With no local bo (Android AHardwareBuffer shim:
+		 * gbm_bo_import fails by design, cpu_dmabuf_fallback; or
+		 * a Linux import failure) the received fd is forwarded
+		 * unmodified, so the application's original offset/stride
+		 * remain correct — rewriting them from a NULL bo would
+		 * hand the compositor a 0 stride (and Mesa's
+		 * gbm_bo_get_stride would dereference the NULL bo). */
 		ctx->message[6] = 0;
 		ctx->message[7] = dmabuf_get_stride(sfd->dmabuf_bo);
 	}
@@ -1591,10 +1597,13 @@ void do_zwp_linux_buffer_params_v1_req_create(struct context *ctx,
 		if (!sfd) {
 			continue;
 		}
-		if (ctx->on_display_side) {
+		if (ctx->on_display_side && sfd->dmabuf_bo != NULL) {
 			/* the new dmabuf being created is not guaranteed to
 			 * have the original offset/stride parameters, so reset
-			 * them */
+			 * them. NULL bo (Android shim cannot import foreign
+			 * fds; see do_wl_drm_req_create_prime_buffer) keeps
+			 * the sender's original values, which are correct for
+			 * the fd as forwarded. */
 			params->add[i].offset = 0;
 			params->add[i].stride =
 					dmabuf_get_stride(sfd->dmabuf_bo);

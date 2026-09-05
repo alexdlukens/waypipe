@@ -165,6 +165,18 @@ int init_render_data(struct render_data *data)
 	 * AHardwareBuffer-backed GBM shim (thirdparty/gbm-android) needs no
 	 * DRM fd: gbm_create_device ignores it, and every buffer is a genuine
 	 * dma-buf fd exported via AHardwareBuffer_getNativeHandle. */
+	/* The shim can NEVER import a foreign dma-buf: gbm_bo_import()
+	 * deliberately fails with ENOTSUP (thirdparty/gbm-android; the
+	 * gdwlroots AHB registry handoff replaced it, and Android gralloc
+	 * refuses buffers it did not allocate). So even though this device
+	 * initialized fine, every shadow of a buffer received over the wire
+	 * must take the CPU/shm mirror path (map_dmabuf_cpu below) instead
+	 * of a GBM import. handlers.c only sets this flag when
+	 * init_render_data() FAILS on the application side — which never
+	 * happens here — so set it unconditionally with the shim device.
+	 * No wire change: the fd is still forwarded to the compositor
+	 * untouched. Set before the idempotent early-returns. */
+	data->cpu_dmabuf_fallback = true;
 	if (data->dev != NULL) {
 		// Silent return, idempotent
 		return 0;
