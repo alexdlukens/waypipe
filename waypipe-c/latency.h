@@ -13,9 +13,14 @@
 #define GDWAYPIPE_LATENCY_H
 
 #include <inttypes.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <time.h>
+
+#if defined(__ANDROID__)
+#include <android/log.h>
+#endif
 
 /* Cached one-time env read; GDWAYPIPE_LATENCY=1 turns telemetry on. */
 static int wp_lat_enabled(void)
@@ -35,6 +40,22 @@ static int64_t wp_lat_now_us(void)
 	struct timespec ts;
 	clock_gettime(CLOCK_MONOTONIC, &ts);
 	return (int64_t)ts.tv_sec * 1000000 + (int64_t)ts.tv_nsec / 1000;
+}
+
+/* Emit one telemetry line. On Android the process's stderr is /dev/null
+ * (no terminal), so route to logcat under the engine's "godot" tag to sit
+ * next to the GDScript [lat] lines (see tools/run_latency.sh on desktop,
+ * where stderr is the stream). liblog is linked for android by SConstruct. */
+static void wp_lat_emit(const char *fmt, ...)
+{
+	va_list ap;
+	va_start(ap, fmt);
+#if defined(__ANDROID__)
+	__android_log_vprint(ANDROID_LOG_INFO, "godot", fmt, ap);
+#else
+	vfprintf(stderr, fmt, ap);
+#endif
+	va_end(ap);
 }
 
 /* Rolling one-second accumulator. idle = time blocked in poll (waiting on the
@@ -78,7 +99,7 @@ static void wp_lat_win_record(struct wp_lat_win *w, int64_t idle_us,
 	}
 	double idle_r = dt ? (double)w->idle_us / (double)dt : 0.0;
 	double busy_r = dt ? (double)w->busy_us / (double)dt : 0.0;
-	fprintf(stderr,
+	wp_lat_emit(
 			"[gdwaypipe-lat] decoder idle_ratio=%.2f busy_ratio=%.2f "
 			"iters/s=%.0f chan_wake/s=%.0f iter_busy_us_avg=%.1f\n",
 			idle_r, busy_r,
@@ -123,7 +144,7 @@ static void wp_lat_video_record(struct wp_lat_video *w, int64_t decode_us)
 	if (dt < 1000000) {
 		return;
 	}
-	fprintf(stderr,
+	wp_lat_emit(
 			"[gdwaypipe-lat] decode frames/s=%.0f decode_ms_avg=%.2f "
 			"decode_ms_max=%.2f\n",
 			(double)w->frames * 1e6 / (double)dt,
