@@ -1554,9 +1554,27 @@ static int setup_color_conv(struct shadow_fd *sfd, struct AVFrame *cpu_frame)
 		return -1;
 	}
 	local_frame->format = avpixfmt;
-	/* adopt padded sizes */
-	local_frame->width = ctx->width;
-	local_frame->height = ctx->height;
+	/* Adopt the DECODED frame's dimensions rather than the codec-context
+	 * allocation hints (ctx->width/height): a 16-aligned remote encoder
+	 * (e.g. the Rust waypipe) pads the coded frame past the surface's
+	 * real size (e.g. 2064 for a 2058-wide window), and the decoder
+	 * emits that padded size when the bitstream carries no crop. The
+	 * intermediate must match what the decoder actually emits so the
+	 * color conversion below is 1:1; the padded right/bottom margin is
+	 * cropped afterwards when the pixels are copied into the real-size
+	 * dmabuf target (copy_from_video_mirror walks dmabuf_info rows and
+	 * strides only, so it never reaches the padding). */
+	if (cpu_frame->width > 0 && cpu_frame->height > 0) {
+		local_frame->width = cpu_frame->width;
+		local_frame->height = cpu_frame->height;
+	} else {
+		/* A failed hardware-frame transfer leaves the temp frame
+		 * zeroed; keep the context hints so the fixed-size mismatch
+		 * guard in apply_video_packet drops the bad frame instead of
+		 * converting from garbage dimensions. */
+		local_frame->width = ctx->width;
+		local_frame->height = ctx->height;
+	}
 	if (av_image_alloc(local_frame->data, local_frame->linesize,
 			    local_frame->width, local_frame->height, avpixfmt,
 			    64) < 0) {
@@ -1652,10 +1670,16 @@ void apply_video_packet(struct shadow_fd *sfd, struct render_data *rd,
 					return;
 				}
 			}
-			/* The DMABUF-shaped local frame was sized once at setup;
-			 * if the decoder emits a frame whose dimensions differ,
-			 * the color conversion would write out of bounds. Drop
-			 * the frame rather than corrupting the surface. */
+			/* Coded-size policy. The color-conversion context and
+			 * intermediate were built for the first decoded
+			 * frame's coded dimensions; the dmabuf copy below
+			 * crops to dmabuf_info (the real surface size), so a
+			 * remote encoder's 16-px coded-frame padding is
+			 * absorbed there and never reaches the compositor.
+			 * Drop only the cases that would make the fixed-size
+			 * conversion write/read out of bounds: a mid-stream
+			 * coded-size CHANGE after setup, or a decoded frame
+			 * SMALLER than the real surface target. */
 			if (cpu_frame->width !=
 					    sfd->video_local_frame->width ||
 					cpu_frame->height !=
@@ -1665,6 +1689,18 @@ void apply_video_packet(struct shadow_fd *sfd, struct render_data *rd,
 						cpu_frame->height,
 						sfd->video_local_frame->width,
 						sfd->video_local_frame->height,
+						sfd->remote_id);
+				return;
+			}
+			if (cpu_frame->width <
+						    (int)sfd->dmabuf_info.width ||
+					cpu_frame->height <
+						    (int)sfd->dmabuf_info.height) {
+				wp_error("Decoded frame %dx%d smaller than surface %ux%u for RID=%d; dropping",
+						cpu_frame->width,
+						cpu_frame->height,
+						sfd->dmabuf_info.width,
+						sfd->dmabuf_info.height,
 						sfd->remote_id);
 				return;
 			}
