@@ -24,6 +24,7 @@
  */
 
 #include "main.h"
+#include "latency.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -1398,9 +1399,32 @@ int main_interface_loop(int chanfd, int progfd, int linkfd,
 	struct pollfd *pfds = NULL;
 	int pfds_size = 0;
 	int exit_code = 0;
+	/* Latency telemetry (decoder/display side only, GDWAYPIPE_LATENCY=1). */
+	int lat = display_side && wp_lat_enabled();
+	struct wp_lat_win lat_win;
+	int64_t lat_prev_top_us = 0;
+	int64_t lat_last_idle_us = 0;
+	int lat_last_chan_wake = 0;
+	int64_t lat_poll_0 = 0;
+	if (lat) {
+		wp_lat_win_init(&lat_win);
+	}
 	while (!shutdown_flag && exit_code == 0 &&
 			!(way_msg.state == WM_TERMINAL &&
 					chan_msg.state == CM_TERMINAL)) {
+		if (lat) {
+			int64_t top = wp_lat_now_us();
+			if (lat_prev_top_us != 0) {
+				int64_t gap = top - lat_prev_top_us;
+				int64_t busy = gap - lat_last_idle_us;
+				if (busy < 0) {
+					busy = 0;
+				}
+				wp_lat_win_record(&lat_win, lat_last_idle_us,
+						busy, lat_last_chan_wake);
+			}
+			lat_prev_top_us = top;
+		}
 		int psize = 4 + count_npipes(&g.map);
 		if (buf_ensure_size(psize, sizeof(struct pollfd), &pfds_size,
 				    (void **)&pfds) == -1) {
@@ -1448,7 +1472,17 @@ int main_interface_loop(int chanfd, int progfd, int linkfd,
 		} else {
 			poll_delay = -1;
 		}
+		if (lat) {
+			lat_poll_0 = wp_lat_now_us();
+		}
 		int r = poll(pfds, (nfds_t)npoll, poll_delay);
+		if (lat) {
+			lat_last_idle_us = wp_lat_now_us() - lat_poll_0;
+			lat_last_chan_wake = (pfds[0].revents &
+						 (POLLIN | POLLHUP | POLLOUT))
+						 ? 1
+						 : 0;
+		}
 		if (r == -1) {
 			if (errno == EINTR) {
 				wp_error("poll interrupted: shutdown=%c",

@@ -24,6 +24,7 @@
  */
 
 #include "shadow.h"
+#include "latency.h"
 
 /* DIAG (2026-08-02, black-screen investigation): decoder stderr does not
  * reach logcat on Android; write probes directly under gdwaypipe-diag.
@@ -1584,6 +1585,18 @@ static int setup_color_conv(struct shadow_fd *sfd, struct AVFrame *cpu_frame)
 void apply_video_packet(struct shadow_fd *sfd, struct render_data *rd,
 		const struct bytebuf *msg)
 {
+	/* Latency telemetry: per-frame YUV->RGB + dmabuf-write cost (client
+	 * decode), GDWAYPIPE_LATENCY=1. */
+	static int g_lat_video_ready = 0;
+	static struct wp_lat_video g_lat_video;
+	if (wp_lat_enabled()) {
+		if (!g_lat_video_ready) {
+			wp_lat_video_init(&g_lat_video);
+			g_lat_video_ready = 1;
+		}
+	}
+	int lat_video_on = wp_lat_enabled();
+	int64_t lat_f0 = 0;
 	sfd->video_packet->data = (uint8_t *)msg->data;
 	sfd->video_packet->size = (int)msg->size;
 
@@ -1657,6 +1670,9 @@ void apply_video_packet(struct shadow_fd *sfd, struct render_data *rd,
 			}
 
 
+			if (lat_video_on) {
+				lat_f0 = wp_lat_now_us();
+			}
 			/* Handle frame immediately, since the next receive run
 			 * will clear it again */
 			if (sws_scale(sfd->video_color_context,
@@ -1694,6 +1710,10 @@ void apply_video_packet(struct shadow_fd *sfd, struct render_data *rd,
 					&sfd->dmabuf_info);
 			unmap_dmabuf(sfd->dmabuf_bo, handle);
 			dmabuf_sync_end(sfd->fd_local, true);
+			if (lat_video_on) {
+				wp_lat_video_record(&g_lat_video,
+						wp_lat_now_us() - lat_f0);
+			}
 		} else {
 			if (recvstat != AVERROR(EAGAIN)) {
 				wp_error("Failed to receive frame due to error: %s",
