@@ -41,6 +41,11 @@ typedef VAGenericID VASurfaceID;
 typedef VAGenericID VABufferID;
 typedef struct ZSTD_CCtx_s ZSTD_CCtx;
 typedef struct ZSTD_DCtx_s ZSTD_DCtx;
+#ifdef __ANDROID__
+/* Android MediaCodec surface-mode pool state (android_video.h); the
+ * struct definition is private to android_video.c. */
+struct av_android_sfd;
+#endif
 
 struct comp_ctx {
 	void *lz4_extstate;
@@ -236,16 +241,35 @@ struct shadow_fd {
 	struct AVFrame *video_local_frame; /* In format matching DMABUF */
 	struct AVFrame *video_tmp_frame;   /* To hold intermediate copies */
 	struct AVFrame *video_yuv_frame;   /* In enc/dec preferred format */
+	/* Holds the newest decoded frame by reference across the receive
+	 * drain: avcodec_receive_frame unrefs video_yuv_frame even on the
+	 * final EAGAIN, so the last frame must be ref'd to survive. */
+	struct AVFrame *video_last_frame;
 	void *video_yuv_frame_data;
 	void *video_local_frame_data;
 	struct AVPacket *video_packet;
 	struct SwsContext *video_color_context;
+	/* Android hw-decode upgrade state: h264_mediacodec requires SPS/PPS
+	 * extradata at avcodec_open2, but the stream only carries parameter
+	 * sets in-band later. The decoder opens in software and upgrades to
+	 * MediaCodec on the first packet carrying both (try_hw_upgrade). */
+	bool video_hw_upgrade_pending;
+	bool video_hw_upgrade_failed;
 	int64_t video_frameno;
 	enum video_coding_fmt video_fmt;
 
 	VASurfaceID video_va_surface;
+
 	VAContextID video_va_context;
 	VABufferID video_va_pipeline;
+#ifdef __ANDROID__
+	/* Android MediaCodec surface-mode pool binding (android_video.h).
+	 * NULL while this sfd decodes on the software ladder. When set,
+	 * video_context points at the pool-owned AVCodecContext — it is
+	 * NEVER freed per-sfd; teardown goes through av_android_pool_release
+	 * (see android-hw-decode-design.md §5.5). */
+	struct av_android_sfd *video_android;
+#endif
 };
 
 const char *compression_mode_to_str(enum compression_mode mode);
