@@ -70,11 +70,5 @@ void av_android_pool_flush(struct shadow_fd *sfd);
  * non-NULL, receives the blit cost in microseconds for wp_lat telemetry. */
 int av_android_blit_latest(struct shadow_fd *sfd, struct AVFrame *hw_frame,
 		int64_t *lat_us);
-
-/* The sfd's dmabuf target was (re)allocated: (re)build the EGLImage/FBO
- * from the current sfd->dmabuf_bo AHB. Called lazily-safe: no-op without
- * a bound entry, and idempotent when the target is unchanged. */
-void av_android_sfd_target_changed(struct shadow_fd *sfd);
-
 #endif /* __ANDROID__ && HAS_VIDEO */
 #endif /* WAYPIPE_ANDROID_VIDEO_H */

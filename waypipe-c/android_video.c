@@ -112,7 +112,6 @@ struct av_pool_entry {
 	ANativeWindow *win;
 	/* GL */
 	GLuint oes_tex;                 /* ASurfaceTexture attach target */
-	GLuint prog;                    /* shared OES program handle */
 	float st_matrix[16];            /* refreshed per updateTexImage */
 	/* bookkeeping */
 	int64_t last_used_ms;
@@ -709,7 +708,6 @@ static void teardown_entry(struct av_pool_entry *entry)
 		glDeleteTextures(1, &entry->oes_tex);
 		entry->oes_tex = 0;
 	}
-	entry->prog = 0;
 	entry->owner = NULL;
 	entry->fmt = VIDEO_H264;
 	entry->stream_serial = 0;
@@ -998,7 +996,6 @@ int av_android_pool_setup(struct shadow_fd *sfd, struct render_data *rd,
 		/* OPENING: build the whole stack, then the decoder. */
 		entry->state = AV_POOL_OPENING;
 		entry->owner = NULL;
-		entry->prog = 0;
 		memset(entry->st_matrix, 0, sizeof(entry->st_matrix));
 		entry->st_matrix[0] = 1.0f;
 		entry->st_matrix[5] = 1.0f;
@@ -1057,7 +1054,6 @@ int av_android_pool_setup(struct shadow_fd *sfd, struct render_data *rd,
 			pthread_mutex_unlock(&g_hw.lock);
 			return -1;
 		}
-		entry->prog = g_hw.prog;
 
 		if (!open_hw_device(entry)) {
 			DIAG_ANDROID_LOG("[decode-pool] dead RID=%d fmt=%s: hw device\n",
@@ -1195,37 +1191,6 @@ void av_android_pool_flush(struct shadow_fd *sfd)
 	pthread_mutex_unlock(&g_hw.lock);
 }
 
-/* Target (re)build. Called from the same place that re-runs the dmabuf
- * allocation; the pool entry survives the resize (design section 4.3). */
-void av_android_sfd_target_changed(struct shadow_fd *sfd)
-{
-	if (!sfd || sfd->video_android == NULL) {
-		return;
-	}
-	struct av_android_sfd *as = sfd->video_android;
-	pthread_mutex_lock(&g_hw.lock);
-	if (as->entry == NULL || as->entry->owner != sfd ||
-			as->entry->state != AV_POOL_ACTIVE) {
-		pthread_mutex_unlock(&g_hw.lock);
-		return;
-	}
-	if (!egl_ensure_current()) {
-		as->entry->state = AV_POOL_DEAD;
-		DIAG_ANDROID_LOG("[decode-pool] dead RID=%d: EGL context lost\n",
-				sfd->remote_id);
-		pthread_mutex_unlock(&g_hw.lock);
-		return;
-	}
-	if (sfd_target_rebuild(sfd, as)) {
-		DIAG_ANDROID_LOG("[decode-blit] target rebuilt RID=%d %ux%u\n",
-				sfd->remote_id, as->target_w, as->target_h);
-	} else {
-		as->sw_fallback = true;
-		DIAG_ANDROID_LOG("[decode-blit] fail RID=%d (target rebuild)\n",
-				sfd->remote_id);
-	}
-	pthread_mutex_unlock(&g_hw.lock);
-}
 
 int av_android_blit_latest(struct shadow_fd *sfd, struct AVFrame *hw_frame,
 		int64_t *lat_us)
@@ -1426,11 +1391,6 @@ int av_android_blit_latest(struct shadow_fd *sfd, struct AVFrame *hw_frame,
 	(void)hw_frame;
 	(void)lat_us;
 	return -1;
-}
-
-void av_android_sfd_target_changed(struct shadow_fd *sfd)
-{
-	(void)sfd;
 }
 
 #endif /* __ANDROID__ && HAS_VIDEO */
