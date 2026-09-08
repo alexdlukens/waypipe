@@ -259,7 +259,20 @@ static bool egl_bootstrap(void)
 		return false;
 	}
 	if (!eglInitialize(g_hw.dpy, NULL, NULL)) {
-		DIAG_ANDROID_LOG("[decode-surface] FAIL eglInitialize\n");
+		DIAG_ANDROID_LOG("[decode-surface] FAIL eglInitialize err=0x%x\n",
+				(unsigned)eglGetError());
+		return false;
+	}
+	/* One-shot driver identity + capability evidence: a display that
+	 * accepts MakeCurrent but binds nothing (the observed Quest-runtime
+	 * failure) is distinguishable from here. */
+	DIAG_ANDROID_LOG("[decode-surface] EGL vendor='%s' ver='%s' client_apis='%s'\n",
+			eglQueryString(g_hw.dpy, EGL_VENDOR) ?: "?",
+			eglQueryString(g_hw.dpy, EGL_VERSION) ?: "?",
+			eglQueryString(g_hw.dpy, EGL_CLIENT_APIS) ?: "?");
+	if (!eglBindAPI(EGL_OPENGL_ES_API)) {
+		DIAG_ANDROID_LOG("[decode-surface] FAIL eglBindAPI(OPENGL_ES) err=0x%x\n",
+				(unsigned)eglGetError());
 		return false;
 	}
 
@@ -272,18 +285,24 @@ static bool egl_bootstrap(void)
 	EGLint n_cfg = 0;
 	if (!eglChooseConfig(g_hw.dpy, cfg_attribs, &cfg, 1, &n_cfg) ||
 			n_cfg < 1) {
-		DIAG_ANDROID_LOG("[decode-surface] FAIL eglChooseConfig(ES3)\n");
+		DIAG_ANDROID_LOG("[decode-surface] FAIL eglChooseConfig(ES3) err=0x%x\n",
+				(unsigned)eglGetError());
 		return false;
 	}
 	g_hw.cfg = cfg;
 
-	/* Surfaceless preferred; pbuffer fallback. No sharing: this is the
-	 * only GLES context in the process (Godot and gdwlroots are
-	 * Vulkan-only on this platform). */
+	/* Explicit client API + version: NULL attribs rely on the display's
+	 * "current" client API state, which on this runtime was observed to
+	 * produce a context that MakeCurrent accepts without binding anything. */
+	const EGLint ctx_attribs[] = {
+		EGL_CONTEXT_MAJOR_VERSION, 3,
+		EGL_NONE,
+	};
 	EGLContext ctx = eglCreateContext(
-			g_hw.dpy, cfg, EGL_NO_CONTEXT, NULL);
+			g_hw.dpy, cfg, EGL_NO_CONTEXT, ctx_attribs);
 	if (ctx == EGL_NO_CONTEXT) {
-		DIAG_ANDROID_LOG("[decode-surface] FAIL eglCreateContext\n");
+		DIAG_ANDROID_LOG("[decode-surface] FAIL eglCreateContext(ES3) err=0x%x\n",
+				(unsigned)eglGetError());
 		return false;
 	}
 
@@ -295,7 +314,32 @@ static bool egl_bootstrap(void)
 	EGLSurface pb = eglCreatePbufferSurface(g_hw.dpy, cfg,
 			pbuffer_attribs);
 	bool have_pb = pb != EGL_NO_SURFACE;
+	if (!have_pb) {
+		/* Surfaceless contexts then carry everything; fine per EGL 1.5,
+		 * but the make-current below must be verified. */
+		DIAG_ANDROID_LOG("[decode-surface] pbuffer create failed err=0x%x; using surfaceless\n",
+				(unsigned)eglGetError());
+	}
 	g_hw.ctx = ctx;
+	if (!eglMakeCurrent(g_hw.dpy, have_pb ? pb : EGL_NO_SURFACE,
+			have_pb ? pb : EGL_NO_SURFACE, ctx)) {
+		DIAG_ANDROID_LOG("[decode-surface] FAIL eglMakeCurrent (surfaceless=%d pbuffer=%d) err=0x%x\n",
+				!have_pb, have_pb, (unsigned)eglGetError());
+		eglDestroyContext(g_hw.dpy, ctx);
+		return false;
+	}
+	/* Verify the bind actually took (the runtime that produced the
+	 * pc=0 dispatch crash returned EGL_TRUE from MakeCurrent while
+	 * binding nothing). */
+	if (eglGetCurrentContext() != ctx) {
+		DIAG_ANDROID_LOG("[decode-surface] FAIL MakeCurrent not visible (cur=%p ctx=%p) err=0x%x\n",
+				(void *)eglGetCurrentContext(), (void *)ctx,
+				(unsigned)eglGetError());
+		eglMakeCurrent(g_hw.dpy, EGL_NO_SURFACE, EGL_NO_SURFACE,
+				EGL_NO_CONTEXT);
+		eglDestroyContext(g_hw.dpy, ctx);
+		return false;
+	}
 	{
 		/* Known-good GL moment: build the OES program here, and log the
 		 * driver identity once. If the driver dispatch is broken, this is
