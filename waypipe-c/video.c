@@ -2199,13 +2199,21 @@ void apply_video_packet(struct shadow_fd *sfd, struct render_data *rd,
 #endif
 #ifdef __ANDROID__
 		if (sfd->video_android &&
-				sfd->video_yuv_frame->hw_frames_ctx != NULL &&
 				sfd->video_yuv_frame->format ==
 						AV_PIX_FMT_MEDIACODEC) {
 			/* Surface mode (pool bound, design §4.1): hold the
 			 * newest MEDIACODEC frame by reference exactly like a
 			 * software frame; its data[3] AVMediaCodecBuffer is
 			 * consumed after the drain by av_android_blit_latest.
+			 * NOTE: format alone identifies these frames — vendored
+			 * mediacodecdec_common.c sets data[3] but NEVER
+			 * hw_frames_ctx on surface-mode output, so a
+			 * hw_frames_ctx requirement here silently routed every
+			 * hw frame into the sws path (which cannot read
+			 * MEDIACODEC frames), dropping all decoded output.
+			 * A pool-bound surface-mode context emits ONLY
+			 * MEDIACODEC frames, and the deferred-SW context never
+			 * does, so format is an unambiguous discriminator.
 			 * A previously held surface frame (from this drain or
 			 * an earlier packet) is dropped with an explicit
 			 * render=0 release before the ref swap: the
@@ -2291,7 +2299,12 @@ void apply_video_packet(struct shadow_fd *sfd, struct render_data *rd,
 		return;
 	}
 #ifdef __ANDROID__
-	if (sfd->video_android && last_is_hw &&
+	/* Format check only: surface-mode MEDIACODEC frames carry no
+	 * hw_frames_ctx (see the drain comment above), so last_is_hw —
+	 * which the drain sets from the same faulty test — must not gate
+	 * the present path. A pool-bound context only ever produces
+	 * MEDIACODEC frames. */
+	if (sfd->video_android &&
 			sfd->video_last_frame->format ==
 					AV_PIX_FMT_MEDIACODEC) {
 		/* Surface-mode present (design §4.1): instead of sws+copy,

@@ -85,7 +85,12 @@ struct AHardwareBuffer *gbm_android_bo_get_ahb(struct gbm_bo *bo);
 
 /* --- Data structures (design section 3) -------------------------------- */
 
-#define AV_POOL_MAX 4
+/* Burst headroom: a resize storm creates several sibling sfds within
+ * milliseconds while their predecessors are still ACTIVE (device evidence:
+ * 3 extra 1506x658 sdFs in 25 ms latched SW on a full 4-slot pool). Old
+ * sdfs release their entries to IDLE moments later, so the burst fits and
+ * the freed slots are reused (hit path) instead of leaking decoders. */
+#define AV_POOL_MAX 8
 
 enum av_pool_state {
 	AV_POOL_UNUSED,
