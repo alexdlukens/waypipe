@@ -528,6 +528,26 @@ static void jni_clear_exception(JNIEnv *env)
 
 static bool open_surface_stack(struct av_pool_entry *entry)
 {
+	/* The SurfaceTexture below is created in ATTACHED mode bound to the
+	 * OES texture generated here (constructor takes the texture name).
+	 * That requires our context current on this thread; it also means
+	 * attachToGLContext must never be called afterwards — it fails with
+	 * INVALID_OPERATION (-38) for an already-attached SurfaceTexture,
+	 * which is exactly the round-3 device failure. */
+	if (!egl_ensure_current()) {
+		return false;
+	}
+	glGenTextures(1, &entry->oes_tex);
+	glBindTexture(GL_TEXTURE_EXTERNAL_OES, entry->oes_tex);
+	glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MIN_FILTER,
+			GL_LINEAR);
+	glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MAG_FILTER,
+			GL_LINEAR);
+	glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_WRAP_S,
+			GL_CLAMP_TO_EDGE);
+	glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_WRAP_T,
+			GL_CLAMP_TO_EDGE);
+
 	if (!jni_thread_attach()) {
 		return false;
 	}
@@ -535,9 +555,8 @@ static bool open_surface_stack(struct av_pool_entry *entry)
 	(*gdwaypipe_android_jvm)->GetEnv(gdwaypipe_android_jvm,
 			(void **)&env, JNI_VERSION_1_6);
 
-	/* new SurfaceTexture(0): single-buffer-mode texture image stream.
-	 * The surfaceless EGL context means there is no GL consumer yet;
-	 * attachToGLContext binds our own OES texture afterwards. */
+	/* new SurfaceTexture(oes_tex): attached-mode, multi-buffer stream
+	 * consumer bound to our texture in the current context. */
 	jclass cls = (*env)->FindClass(env, "android/graphics/SurfaceTexture");
 	if (cls == NULL) {
 		jni_clear_exception(env);
@@ -550,10 +569,12 @@ static bool open_surface_stack(struct av_pool_entry *entry)
 		DIAG_ANDROID_LOG("[decode-surface] FAIL SurfaceTexture.<init>(I) lookup\n");
 		return false;
 	}
-	jobject st_obj = (*env)->NewObject(env, cls, ctor, (jint)0);
+	jobject st_obj = (*env)->NewObject(env, cls, ctor,
+			(jint)entry->oes_tex);
 	if (st_obj == NULL) {
 		jni_clear_exception(env);
-		DIAG_ANDROID_LOG("[decode-surface] FAIL SurfaceTexture(0) ctor\n");
+		DIAG_ANDROID_LOG("[decode-surface] FAIL SurfaceTexture(%u) ctor\n",
+				entry->oes_tex);
 		return false;
 	}
 	/* Both objects live across pool entries and outlive this JNI call:
@@ -1129,27 +1150,6 @@ int av_android_pool_setup(struct shadow_fd *sfd, struct render_data *rd,
 			pthread_mutex_unlock(&g_hw.lock);
 			return -1;
 		}
-		glGenTextures(1, &entry->oes_tex);
-		glBindTexture(GL_TEXTURE_EXTERNAL_OES, entry->oes_tex);
-		glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MIN_FILTER,
-				GL_LINEAR);
-		glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MAG_FILTER,
-				GL_LINEAR);
-		glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_WRAP_S,
-				GL_CLAMP_TO_EDGE);
-		glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_WRAP_T,
-				GL_CLAMP_TO_EDGE);
-		int aerr = ASurfaceTexture_attachToGLContext(entry->st,
-				entry->oes_tex);
-		if (aerr != 0) {
-			DIAG_ANDROID_LOG("[decode-surface] FAIL attachToGLContext tex=%u err=%d\n",
-					entry->oes_tex, aerr);
-			teardown_entry(entry);
-			g_hw.n_entries--;
-			pthread_mutex_unlock(&g_hw.lock);
-			return -1;
-		}
-
 		if (!open_hw_device(entry)) {
 			DIAG_ANDROID_LOG("[decode-pool] dead RID=%d fmt=%s: hw device\n",
 					sfd->remote_id,
