@@ -979,19 +979,40 @@ static bool pool_evict_idle(bool force)
  * pool is full. The size bucket (design section 5.2 layer 2) keeps a
  * decoder configured for another resolution from being reused when the
  * device codec ignores adaptive playback. */
+/* Venus HW decoder capacity (Quest 3 msm_vidc): the device hard-fails
+ * with 'H/W is overloaded. needed: 9958195 max: 7833600' + 'streamon
+ * failed' once ~5 concurrent h264 instances run (device evidence
+ * 2026-09-07: 14 RIDs/30 s → codecs died → permanently black AHBs and a
+ * session-ending error flood). Keep at most this many live MediaCodec
+ * instances; overflow sdfs run the software decoder, which produces
+ * valid (slower) frames on the CPU. */
+#define AV_HW_ACTIVE_MAX 3
+
 static struct av_pool_entry *pool_free_slot(enum video_coding_fmt fmt,
 		uint32_t bucket, bool *evicted)
 {
 	struct av_pool_entry *free_slot = NULL;
+	int active = 0;
 	for (int i = 0; i < AV_POOL_MAX; i++) {
 		struct av_pool_entry *e = &g_hw.entries[i];
 		if (e->state == AV_POOL_IDLE && e->fmt == fmt &&
 				e->size_bucket == bucket) {
 			return e; /* cheapest: no open needed */
 		}
+		if (e->state == AV_POOL_ACTIVE ||
+				e->state == AV_POOL_OPENING) {
+			active++;
+		}
 		if (e->state == AV_POOL_UNUSED && !free_slot) {
 			free_slot = e;
 		}
+	}
+	if (active >= AV_HW_ACTIVE_MAX) {
+		/* Caller falls back to the per-sfd software ladder; no latch
+		 * here — later sfds get hw when active instances retire. */
+		DIAG_ANDROID_LOG("[decode-pool] hw busy (%d active, max %d); software decode\n",
+				active, AV_HW_ACTIVE_MAX);
+		return NULL;
 	}
 	if (free_slot) {
 		g_hw.n_entries++;

@@ -2103,6 +2103,29 @@ static int setup_color_conv(struct shadow_fd *sfd, struct AVFrame *cpu_frame)
 	sfd->video_color_context = sws;
 	return 0;
 }
+#ifdef __ANDROID__
+/* A pool-bound codec died mid-stream (device evidence 2026-09-07: Venus
+ * HW overload kills OMX instances; the sfd then floods errors and shows a
+ * stale, never-blitted black AHB forever). Demote the sfd to the software
+ * ladder — same teardown shape as the blit-failure path. */
+static void android_demote_to_sw(struct shadow_fd *sfd,
+		struct render_data *rd, const char *why)
+{
+	DIAG_VIDEO_LOG("[decode-upgrade] FAIL RID=%d %s; rebinding software\n",
+			sfd->remote_id, why);
+	sfd->video_context = NULL;
+	av_android_pool_release(sfd, false);
+	sfd->video_hw_upgrade_failed = true;
+	av_frame_free(&sfd->video_yuv_frame);
+	av_packet_free(&sfd->video_packet);
+	sfd->video_yuv_frame_data = NULL;
+	if (setup_video_decode(sfd, rd) < 0) {
+		wp_error("Failed to rebuild software decoder after %s (RID=%d)",
+				why, sfd->remote_id);
+	}
+}
+#endif
+
 
 void apply_video_packet(struct shadow_fd *sfd, struct render_data *rd,
 		const struct bytebuf *msg)
@@ -2150,6 +2173,14 @@ void apply_video_packet(struct shadow_fd *sfd, struct render_data *rd,
 			sfd->video_context, sfd->video_packet);
 	if (sendstat < 0) {
 		wp_error("Failed to send packet: %s", av_err2str(sendstat));
+#ifdef __ANDROID__
+		if (sfd->video_android && sendstat != AVERROR(EAGAIN)) {
+			/* Dead/failed pool codec (e.g. Venus HW overload);
+			 * EAGAIN is mere backpressure — never demote on it. */
+			android_demote_to_sw(sfd, rd, "codec send failed");
+			return;
+		}
+#endif
 	}
 
 	/* Drain all produced frames; only the most recent one is rendered.
@@ -2181,6 +2212,13 @@ void apply_video_packet(struct shadow_fd *sfd, struct render_data *rd,
 				wp_error("Failed to receive frame due to error: %s",
 						av_err2str(recvstat));
 			}
+#ifdef __ANDROID__
+			if (sfd->video_android) {
+				android_demote_to_sw(sfd, rd,
+						"codec receive failed");
+				return;
+			}
+#endif
 			break;
 		}
 		have_frame = 1;
@@ -2337,20 +2375,10 @@ void apply_video_packet(struct shadow_fd *sfd, struct render_data *rd,
 			 * pool acquire for this sfd. The frame is lost (its
 			 * buffer was released render=0), and the packet that
 			 * produced it was already consumed by the hw decoder;
-			 * the next packet decodes on the rebuilt software
-			 * context. */
-			DIAG_VIDEO_LOG("[decode-upgrade] FAIL RID=%d blit err=%d; rebinding software\n",
-					sfd->remote_id, blit_err);
-			sfd->video_context = NULL;
-			av_android_pool_release(sfd, false);
-			sfd->video_hw_upgrade_failed = true;
-			av_frame_free(&sfd->video_yuv_frame);
-			av_packet_free(&sfd->video_packet);
-			sfd->video_yuv_frame_data = NULL;
-			if (setup_video_decode(sfd, rd) < 0) {
-				wp_error("Failed to rebuild software decoder after blit failure (RID=%d)",
-						sfd->remote_id);
-			}
+			 * the demotion mirrors the blit-failure rung-6 path. */
+			char why[48];
+			snprintf(why, sizeof(why), "blit err=%d", blit_err);
+			android_demote_to_sw(sfd, rd, why);
 		}
 		return;
 	}
