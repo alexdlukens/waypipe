@@ -202,7 +202,37 @@ static int64_t pool_now_ms(void)
 	return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
 }
 
-/* --- EGL bootstrap and context (design section 4.4) -------------------- */
+/* Attach the calling thread to the JVM (idempotent). MUST run before any
+ * EGL/GLES work: the first ART AttachCurrentThread on a thread whose GLES
+ * driver TLS state already exists zeroes the driver's dispatch table on at
+ * least the Quest runtime (observed 2026-09-07: glCreateProgram jumped to
+ * pc=0 right after the first AttachCurrentThread, while libEGL still
+ * reported the context current). Attaching first makes the ART thread
+ * registration precede driver TLS init, which keeps both intact. */
+static bool jni_thread_attach(void)
+{
+	if (gdwaypipe_android_jvm == NULL) {
+		DIAG_ANDROID_LOG("[decode-surface] FAIL no JavaVM (capture ladder has not armed yet)\n");
+		return false;
+	}
+	JNIEnv *env = NULL;
+	if ((*gdwaypipe_android_jvm)->GetEnv(gdwaypipe_android_jvm,
+			    (void **)&env, JNI_VERSION_1_6) == JNI_OK) {
+		return true;
+	}
+	if ((*gdwaypipe_android_jvm)->AttachCurrentThread(
+			    gdwaypipe_android_jvm, &env, NULL) != JNI_OK) {
+		DIAG_ANDROID_LOG("[decode-surface] FAIL AttachCurrentThread\n");
+		return false;
+	}
+	DIAG_ANDROID_LOG("[decode-surface] thread attached to JVM %p\n",
+			(const void *)gdwaypipe_android_jvm);
+	return true;
+}
+
+static bool gl_build_program(void);
+
+ /* --- EGL bootstrap and context (design section 4.4) -------------------- */
 
 /* Lazy, once per process. A failure latches g_hw.egl_ok = false and the
  * software ladder takes over for every subsequent frame. */
@@ -214,7 +244,14 @@ static bool egl_bootstrap(void)
 	if (g_hw.inited) {
 		return false; /* previous attempt failed; stay latched */
 	}
+	/* JVM attach FIRST — see jni_thread_attach for why this must precede
+	 * every EGL/GLES call on this thread. */
+	if (!jni_thread_attach()) {
+		g_hw.inited = true;
+		return false;
+	}
 	g_hw.inited = true;
+
 
 	g_hw.dpy = eglGetDisplay(EGL_DEFAULT_DISPLAY);
 	if (g_hw.dpy == EGL_NO_DISPLAY) {
@@ -258,14 +295,24 @@ static bool egl_bootstrap(void)
 	EGLSurface pb = eglCreatePbufferSurface(g_hw.dpy, cfg,
 			pbuffer_attribs);
 	bool have_pb = pb != EGL_NO_SURFACE;
-	if (!eglMakeCurrent(g_hw.dpy, have_pb ? pb : EGL_NO_SURFACE,
-			have_pb ? pb : EGL_NO_SURFACE, ctx)) {
-		DIAG_ANDROID_LOG("[decode-surface] FAIL eglMakeCurrent (surfaceless=%d pbuffer=%d)\n",
-				!have_pb, have_pb);
+	g_hw.ctx = ctx;
+	{
+		/* Known-good GL moment: build the OES program here, and log the
+		 * driver identity once. If the driver dispatch is broken, this is
+		 * the earliest, best-annotated crash point; on healthy drivers
+		 * the program is simply ready before any SurfaceTexture work. */
+		const char *gl_ver = (const char *)glGetString(GL_VERSION);
+		const char *gl_ren = (const char *)glGetString(GL_RENDERER);
+		DIAG_ANDROID_LOG("[decode-surface] GL %s / %s\n",
+				gl_ver ? gl_ver : "?", gl_ren ? gl_ren : "?");
+	}
+	if (!gl_build_program()) {
+		DIAG_ANDROID_LOG("[decode-surface] FAIL OES program at bootstrap\n");
+		eglMakeCurrent(g_hw.dpy, EGL_NO_SURFACE, EGL_NO_SURFACE,
+				EGL_NO_CONTEXT);
 		eglDestroyContext(g_hw.dpy, ctx);
 		return false;
 	}
-	g_hw.ctx = ctx;
 
 	/* The blit target needs EGL_ANDROID_get_native_client_buffer and
 	 * OES_EGL_image; without them the AHB can never be written. */
@@ -295,8 +342,9 @@ static bool egl_bootstrap(void)
 	}
 
 	g_hw.egl_ok = true;
-	DIAG_ANDROID_LOG("[decode-surface] EGL ok dpy=%p ctx=%p surfaceless=%d\n",
-			(void *)g_hw.dpy, (void *)g_hw.ctx, !have_pb);
+	DIAG_ANDROID_LOG("[decode-surface] EGL ok dpy=%p ctx=%p prog=%u surfaceless=%d\n",
+			(void *)g_hw.dpy, (void *)g_hw.ctx, g_hw.prog,
+			!have_pb);
 	return true;
 }
 
@@ -305,12 +353,22 @@ static bool egl_ensure_current(void)
 	if (!g_hw.egl_ok) {
 		return false;
 	}
+	/* Always rebind: the observed device failure had libEGL report the
+	 * context current while the GLES driver's dispatch was gone, so the
+	 * eglGetCurrentContext()==ctx skip path is not trustworthy. MakeCurrent
+	 * is microseconds; verify the result both ways and surface eglGetError.
+	 * Callers must have gone through jni_thread_attach (egl_bootstrap does). */
+	if (!eglMakeCurrent(g_hw.dpy, EGL_NO_SURFACE, EGL_NO_SURFACE,
+			    g_hw.ctx)) {
+		DIAG_ANDROID_LOG("[decode-surface] FAIL eglMakeCurrent(rebind) err=0x%x\n",
+				(unsigned)eglGetError());
+		return false;
+	}
 	if (eglGetCurrentContext() != g_hw.ctx) {
-		if (!eglMakeCurrent(g_hw.dpy, EGL_NO_SURFACE, EGL_NO_SURFACE,
-				g_hw.ctx)) {
-			DIAG_ANDROID_LOG("[decode-surface] FAIL eglMakeCurrent(rebind)\n");
-			return false;
-		}
+		DIAG_ANDROID_LOG("[decode-surface] FAIL rebind not visible (cur=%p ctx=%p)\n",
+				(void *)eglGetCurrentContext(),
+				(void *)g_hw.ctx);
+		return false;
 	}
 	return true;
 }
@@ -426,19 +484,12 @@ static void jni_clear_exception(JNIEnv *env)
 
 static bool open_surface_stack(struct av_pool_entry *entry)
 {
-	if (gdwaypipe_android_jvm == NULL) {
-		DIAG_ANDROID_LOG("[decode-surface] FAIL no JavaVM (capture ladder has not armed yet)\n");
+	if (!jni_thread_attach()) {
 		return false;
 	}
 	JNIEnv *env = NULL;
-	if ((*gdwaypipe_android_jvm)->GetEnv(gdwaypipe_android_jvm,
-			(void **)&env, JNI_VERSION_1_6) != JNI_OK) {
-		if ((*gdwaypipe_android_jvm)->AttachCurrentThread(
-				gdwaypipe_android_jvm, &env, NULL) != JNI_OK) {
-			DIAG_ANDROID_LOG("[decode-surface] FAIL AttachCurrentThread\n");
-			return false;
-		}
-	}
+	(*gdwaypipe_android_jvm)->GetEnv(gdwaypipe_android_jvm,
+			(void **)&env, JNI_VERSION_1_6);
 
 	/* new SurfaceTexture(0): single-buffer-mode texture image stream.
 	 * The surfaceless EGL context means there is no GL consumer yet;
