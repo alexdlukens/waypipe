@@ -767,8 +767,11 @@ void destroy_video_data(struct shadow_fd *sfd)
 		av_android_pool_release(sfd, false);
 	}
 #endif
+#ifdef __ANDROID__
+	av_freep(&sfd->video_hw_extradata);
+	sfd->video_hw_extradata_size = 0;
+#endif
 }
-
 static void copy_onto_video_mirror(const char *buffer, uint32_t map_stride,
 		AVFrame *frame, const struct dmabuf_slice_data *info)
 {
@@ -1499,7 +1502,15 @@ static void try_hw_upgrade(struct shadow_fd *sfd, struct render_data *rd,
 		int pool_err = av_android_pool_setup(sfd, rd, ps, ps_size,
 				&pool_ctx);
 		/* The pool copies the blob into its freshly opened codec
-		 * context; ownership stays with the caller either way. */
+		 * context; ownership stays with the caller either way.
+		 * Keep an sfd-lifetime copy for the software rebind seed
+		 * (android_demote_to_sw). */
+		av_freep(&sfd->video_hw_extradata);
+		sfd->video_hw_extradata = av_malloc(ps_size);
+		if (sfd->video_hw_extradata) {
+			memcpy(sfd->video_hw_extradata, ps, ps_size);
+			sfd->video_hw_extradata_size = ps_size;
+		}
 		av_freep(&ps);
 		if (pool_err == 0) {
 			/* Swap in the pool's surface-mode context. The old
@@ -1508,18 +1519,19 @@ static void try_hw_upgrade(struct shadow_fd *sfd, struct render_data *rd,
 			 * by apply_video_packet) carry over unchanged, so the
 			 * packet end-of-stream hazard noted in
 			 * apply_video_packet does not apply on this path.
-			 *
 			 * Stream-change handling (design §5.3/§5.5): when the
-			 * pool rebound an already-open entry, that entry
-			 * still holds the previous stream's reference frames
-			 * and in-flight output buffers; av_android_pool_flush
-			 * discards them (avcodec_flush_buffers + serial bump)
-			 * before this sfd's first packet is sent. Flushing a
-			 * freshly opened entry is a harmless no-op, so the
-			 * flush is unconditional instead of trying to
-			 * distinguish rebind from fresh open here. */
+			 * pool rebound an already-open entry, that entry was
+			 * already flushed when it went IDLE at the previous
+			 * sfd's release (av_android_pool_release flushes
+			 * ACTIVE entries on the way to IDLE). Do NOT flush
+			 * again here: on Quest 2's OMX.qcom decoder the
+			 * post-open flush wedged the just-started instance
+			 * (every upgrade then failed at the first receive —
+			 * device evidence 2026-09-07 22:28:47, 'codec receive
+			 * failed' on 100% of upgrades). Flushing a freshly
+			 * opened entry is also pointless: nothing is in
+			 * flight. */
 			avcodec_free_context(&sfd->video_context);
-			av_android_pool_flush(sfd);
 			sfd->video_context = pool_ctx;
 			sfd->video_hw_upgrade_pending = false;
 			DIAG_VIDEO_LOG("[decode-upgrade] ok RID=%d pool=1 extradata=%d bytes\n",
@@ -1692,15 +1704,10 @@ int setup_video_decode(struct shadow_fd *sfd, struct render_data *rd)
 				wp_error("Could not allocate video frame or packet");
 				av_frame_free(&yuv_frame);
 				av_packet_free(&pkt);
-				/* Roll the just-created binding back; the
-				 * entry itself stays IDLE for reuse. */
-				av_android_pool_release(sfd, false);
-			} else {
-				/* Stream-change handling (design §5.3): when
-				 * this acquire rebound an entry that served a
-				 * previous stream, discard its stale in-flight
-				 * buffers first; no-op on a fresh open. */
-				av_android_pool_flush(sfd);
+				/* Rebinds were flushed when the entry went
+				 * IDLE at the previous sfd's release; do not
+				 * flush here — that wedges a freshly opened
+				 * OMX instance (see try_hw_upgrade). */
 				sfd->video_context = pool_ctx;
 				sfd->video_yuv_frame = yuv_frame;
 				sfd->video_packet = pkt;
@@ -2122,6 +2129,23 @@ static void android_demote_to_sw(struct shadow_fd *sfd,
 	if (setup_video_decode(sfd, rd) < 0) {
 		wp_error("Failed to rebuild software decoder after %s (RID=%d)",
 				why, sfd->remote_id);
+		return;
+	}
+	if (sfd->video_hw_extradata && sfd->video_packet) {
+		/* Seed the fresh software decoder with the cached SPS/PPS:
+		 * the stream continues mid-GOP (non-IDR slices, no in-band
+		 * parameter sets), and a blind rebind floods 'non-existing
+		 * PPS 0 referenced' until the next IDR — which may be
+		 * minutes away. Output resumes at the next keyframe. */
+		sfd->video_packet->data = sfd->video_hw_extradata;
+		sfd->video_packet->size = sfd->video_hw_extradata_size;
+		sfd->video_packet->pts = sfd->video_frameno++ * 1000;
+		int ss = avcodec_send_packet(
+				sfd->video_context, sfd->video_packet);
+		if (ss < 0) {
+			wp_error("Failed to seed software decoder with cached parameter sets (RID=%d): %s",
+					sfd->remote_id, av_err2str(ss));
+		}
 	}
 }
 #endif

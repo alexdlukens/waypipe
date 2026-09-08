@@ -257,6 +257,16 @@ struct shadow_fd {
 	bool video_hw_upgrade_failed;
 	int64_t video_frameno;
 	enum video_coding_fmt video_fmt;
+#ifdef __ANDROID__
+	/* SPS/PPS blob (start-code prefixed, h264_extract_ps_extradata
+	 * output) captured at the hw upgrade. When a pool codec dies
+	 * mid-stream, the software rebind is seeded with this blob — a
+	 * blind rebind floods 'non-existing PPS 0 referenced' and decodes
+	 * nothing until the next in-band parameter set, which never comes
+	 * on this stream. Owned by the sfd; freed in destroy_video_data. */
+	uint8_t *video_hw_extradata;
+	int video_hw_extradata_size;
+#endif
 
 	VASurfaceID video_va_surface;
 
