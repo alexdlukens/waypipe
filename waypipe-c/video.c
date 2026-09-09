@@ -117,6 +117,8 @@ void apply_video_packet(struct shadow_fd *sfd, struct render_data *rd,
  * can allocate (drm_to_ahb_format); gbm_android_format_supported()
  * exposes that set. */
 #include <gbm.h>
+#include "libyuv/row.h"
+#include "libyuv/convert_argb.h"
 #endif
 
 #define VIDEO_H264_HW_ENCODER "h264_vaapi"
@@ -1492,6 +1494,11 @@ static int setup_color_conv(struct shadow_fd *sfd, struct AVFrame *cpu_frame)
 		local_frame->width = ctx->width;
 		local_frame->height = ctx->height;
 	}
+	/* Coded-size guard reference, shared with the Android libyuv
+	 * direct path (which has no mirror): the first decoded frame's
+	 * dimensions. */
+	sfd->video_setup_width = local_frame->width;
+	sfd->video_setup_height = local_frame->height;
 	/* Allocate with 16 columns of horizontal padding: the vendored
 	 * ffmpeg's aarch64 unscaled NEON converters (enabled for arbitrary
 	 * widths — see libswscale/aarch64/swscale_unscaled.c) may write up
@@ -1670,6 +1677,52 @@ static void red_fill_apply(struct shadow_fd *sfd)
 			sfd->dmabuf_info.height, sfd->dmabuf_info.format);
 }
 
+#if defined(__ANDROID__)
+/* BT.601 YUV420P (the software decode output format — see the videofmt in
+ * setup_video_decode) -> 32-bit packed, row by row, straight into the
+ * mapped dmabuf. Core-first loop: the 8-pixel NEON core runs on the
+ * 8-aligned prefix (keeps the base pointer at the frame's 64-byte
+ * alignment and never over-reads); the C kernel takes the <8-pixel tail,
+ * with UV advanced by even/2 — UV samples advance half as fast as Y
+ * columns, and advancing by the Y-tail reads past the UV row. abgr
+ * selects XBGR8888 (R,G,B,X bytes) via swapped UV + the Yvu matrix,
+ * matching libyuv's I420ToABGR. */
+static void i420_to_packed_rows(const AVFrame *f, uint8_t *dst, int dst_stride,
+				int width, int height, bool abgr)
+{
+	const uint8_t *y = f->data[0];
+	const uint8_t *u = f->data[1];
+	const uint8_t *v = f->data[2];
+	int su = f->linesize[1];
+	int sv = f->linesize[2];
+	const struct YuvConstants *c;
+	if (abgr) {
+		const uint8_t *t = u; u = v; v = t;
+		int ts = su; su = sv; sv = ts;
+		c = &kYvuI601Constants;
+	} else {
+		c = &kYuvI601Constants;
+	}
+	for (int r = 0; r < height; r++) {
+		int even = width & ~7;
+		if (even) {
+			I422ToARGBRow_NEON(y, u, v, dst, c, even);
+		}
+		if (width - even) {
+			I422ToARGBRow_C(y + even, u + (even >> 1), v + (even >> 1),
+					dst + 4 * (size_t)even, c,
+					width - even);
+		}
+		y += f->linesize[0];
+		dst += dst_stride;
+		if (r & 1) {
+			u += su;
+			v += sv;
+		}
+	}
+}
+#endif
+
 void apply_video_packet(struct shadow_fd *sfd, struct render_data *rd,
 		const struct bytebuf *msg)
 {
@@ -1779,6 +1832,93 @@ void apply_video_packet(struct shadow_fd *sfd, struct render_data *rd,
 		return;
 	}
 
+#if defined(__ANDROID__)
+	{
+		/* libyuv direct path: convert the decoded YUV420P frame
+		 * straight into the mapped AHardwareBuffer, replacing the
+		 * sws_scale -> mirror -> memcpy chain (measured 8.9 ms/frame
+		 * on the Quest). Only for the 32-bit packed formats the row
+		 * kernels target: XRGB8888 -> BGR0 (B,G,R,X bytes) and
+		 * XBGR8888 -> RGB0 (R,G,B,X bytes). Any other surface format
+		 * falls through to the sws path below. */
+		const enum AVPixelFormat mfmt =
+				drm_to_av(sfd->dmabuf_info.format);
+		if (mfmt == AV_PIX_FMT_BGR0 || mfmt == AV_PIX_FMT_RGB0) {
+			static int libyuv_path_announced = 0;
+			if (!libyuv_path_announced) {
+				libyuv_path_announced = 1;
+				DIAG_VIDEO_LOG("[gdwaypipe-diag] video: libyuv direct I420->packed conversion active\n");
+			}
+			/* Coded-size policy, identical to the sws path below:
+			 * the first decoded frame's coded size is the
+			 * reference; a mid-stream change, or a frame smaller
+			 * than the real surface, would make the fixed-size
+			 * row loop read/write out of bounds. */
+			if (sfd->video_setup_width == 0) {
+				sfd->video_setup_width = cpu_frame->width;
+				sfd->video_setup_height = cpu_frame->height;
+			}
+			if (cpu_frame->width != sfd->video_setup_width ||
+					cpu_frame->height !=
+						sfd->video_setup_height) {
+				wp_error("Decoded frame %dx%d mismatches setup %dx%d for RID=%d; dropping",
+						cpu_frame->width,
+						cpu_frame->height,
+						sfd->video_setup_width,
+						sfd->video_setup_height,
+						sfd->remote_id);
+				return;
+			}
+			if (cpu_frame->width <
+					    (int)sfd->dmabuf_info.width ||
+					cpu_frame->height <
+					    (int)sfd->dmabuf_info.height) {
+				wp_error("Decoded frame %dx%d smaller than surface %ux%u for RID=%d; dropping",
+						cpu_frame->width,
+						cpu_frame->height,
+						sfd->dmabuf_info.width,
+						sfd->dmabuf_info.height,
+						sfd->remote_id);
+				return;
+			}
+			if (!sfd->dmabuf_bo) {
+				// ^ was not previously able to create buffer
+				wp_error("DMABUF was not created");
+				return;
+			}
+			if (lat_video_on) {
+				lat_f0 = wp_lat_now_us();
+			}
+			/* B5 contract, same as the sws path: bracket the CPU
+			 * write with DMA_BUF_IOCTL_SYNC so the implicit fence
+			 * orders it against the compositor sampling the
+			 * buffer. */
+			dmabuf_sync_start(sfd->fd_local, true);
+			uint32_t map_stride = 0;
+			void *handle = NULL;
+			char *data = map_dmabuf(sfd->dmabuf_bo, true, &handle,
+					&map_stride);
+			if (!data) {
+				dmabuf_sync_end(sfd->fd_local, true);
+				return;
+			}
+			i420_to_packed_rows(cpu_frame,
+					(uint8_t *)data +
+						sfd->dmabuf_info.offsets[0],
+					(int)map_stride,
+					(int)sfd->dmabuf_info.width,
+					(int)sfd->dmabuf_info.height,
+					mfmt == AV_PIX_FMT_RGB0);
+			unmap_dmabuf(sfd->dmabuf_bo, handle);
+			dmabuf_sync_end(sfd->fd_local, true);
+			if (lat_video_on) {
+				wp_lat_video_record(&g_lat_video,
+						wp_lat_now_us() - lat_f0);
+			}
+			return;
+		}
+	}
+#endif
 		if (!sfd->video_color_context) {
 			if (setup_color_conv(sfd, cpu_frame) == -1) {
 				return;
@@ -1795,14 +1935,14 @@ void apply_video_packet(struct shadow_fd *sfd, struct render_data *rd,
 		 * coded-size CHANGE after setup, or a decoded frame
 		 * SMALLER than the real surface target. */
 		if (cpu_frame->width !=
-				    sfd->video_local_frame->width ||
+				    sfd->video_setup_width ||
 				cpu_frame->height !=
-				    sfd->video_local_frame->height) {
+				    sfd->video_setup_height) {
 			wp_error("Decoded frame %dx%d mismatches setup %dx%d for RID=%d; dropping",
 					cpu_frame->width,
 					cpu_frame->height,
-					sfd->video_local_frame->width,
-					sfd->video_local_frame->height,
+					sfd->video_setup_width,
+					sfd->video_setup_height,
 					sfd->remote_id);
 			return;
 		}

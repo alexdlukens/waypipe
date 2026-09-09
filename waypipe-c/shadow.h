@@ -241,6 +241,12 @@ struct shadow_fd {
 	struct AVFrame *video_last_frame;
 	void *video_yuv_frame_data;
 	void *video_local_frame_data;
+	/* First decoded frame's coded dimensions — the coded-size guard
+	 * reference, shared by the Android libyuv direct path (no mirror)
+	 * and the sws mirror path (setup_color_conv records the same
+	 * values). shadow_fd is calloc'd, so 0/0 = "no frame yet". */
+	int video_setup_width;
+	int video_setup_height;
 	struct AVPacket *video_packet;
 	struct SwsContext *video_color_context;
 	int64_t video_frameno;
