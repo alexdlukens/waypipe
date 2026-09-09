@@ -41,11 +41,6 @@ typedef VAGenericID VASurfaceID;
 typedef VAGenericID VABufferID;
 typedef struct ZSTD_CCtx_s ZSTD_CCtx;
 typedef struct ZSTD_DCtx_s ZSTD_DCtx;
-#ifdef __ANDROID__
-/* Android MediaCodec surface-mode pool state (android_video.h); the
- * struct definition is private to android_video.c. */
-struct av_android_sfd;
-#endif
 
 struct comp_ctx {
 	void *lz4_extstate;
@@ -239,7 +234,6 @@ struct shadow_fd {
 	// Video data
 	struct AVCodecContext *video_context;
 	struct AVFrame *video_local_frame; /* In format matching DMABUF */
-	struct AVFrame *video_tmp_frame;   /* To hold intermediate copies */
 	struct AVFrame *video_yuv_frame;   /* In enc/dec preferred format */
 	/* Holds the newest decoded frame by reference across the receive
 	 * drain: avcodec_receive_frame unrefs video_yuv_frame even on the
@@ -272,14 +266,6 @@ struct shadow_fd {
 
 	VAContextID video_va_context;
 	VABufferID video_va_pipeline;
-#ifdef __ANDROID__
-	/* Android MediaCodec surface-mode pool binding (android_video.h).
-	 * NULL while this sfd decodes on the software ladder. When set,
-	 * video_context points at the pool-owned AVCodecContext — it is
-	 * NEVER freed per-sfd; teardown goes through av_android_pool_release
-	 * (see android-hw-decode-design.md §5.5). */
-	struct av_android_sfd *video_android;
-#endif
 };
 
 const char *compression_mode_to_str(enum compression_mode mode);

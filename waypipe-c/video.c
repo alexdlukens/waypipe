@@ -25,10 +25,6 @@
 
 #include "shadow.h"
 #include "latency.h"
-/* Android MediaCodec surface-mode pool API (android_video.c, design
- * 2026-09-07 §3.4). The header is fully self-guarded: it preprocesses
- * to nothing unless __ANDROID__ && HAS_VIDEO. */
-#include "android_video.h"
 
 /* DIAG (2026-08-02, black-screen investigation): decoder stderr does not
  * reach logcat on Android; write probes directly under gdwaypipe-diag.
@@ -43,112 +39,6 @@
 #define DIAG_VIDEO_LOG(...) fprintf(stderr, "[gdwaypipe-diag] " __VA_ARGS__)
 #endif
 
-#if defined(__ANDROID__) && defined(HAS_VIDEO)
-/* Hardware decode gate #2 (Android): ffmpeg's MediaCodec backend needs the
- * process JavaVM. Godot loads GDExtension .so files with plain dlopen
- * (OS_Android::open_dynamic_library), so ART never runs JNI_OnLoad for us,
- * and the GDScript bootstrap is dead on this engine: 4.8.dev exposes the
- * JavaClassWrapper singleton without any bound methods (no callable
- * wrap()/get_exception() from GDScript or Object::call).
- *
- * Capture order, first resolver wins (all cheap, non-crashable calls):
- *   1. dlsym(RTLD_DEFAULT, "JNI_GetCreatedJavaVMs") — works only if the
- *      app linker namespace has libjvm/libart symbols in its global
- *      scope. Verified NOT the case on the Quest 3 runtime (2026-09-07:
- *      "JNI_GetCreatedJavaVMs unresolved").
- *   2. dlopen("libjvm.so"/"libart.so", RTLD_NOW|RTLD_NOLOAD) + dlsym —
- *      same-namespace visibility; kept for runtimes that do share the
- *      ART libs.
- *   3. The JvmArm Godot Android plugin (m4gr3d
- *      GDExtension-Android-Plugin-Template pattern; panelspace
- *      android-plugins/jvm-arm): ART loads the shim via
- *      System.loadLibrary, the shim's own JNI_OnLoad receives the VM
- *      legally, and the shim then dlopen()s this exact library file and
- *      calls the exported gdwaypipe_arm_jvm(vm) below. Our own
- *      JNI_OnLoad export also catches any direct System.load of this
- *      file. This is the rung that works on namespace-restricted
- *      runtimes.
- *
- * (A former rung 3 — a manual .dynsym scan of the libart mapping via
- * dl_iterate_phdr — was REMOVED 2026-09-07 after it SIGSEGV'd on device:
- * .dynamic pointer semantics differ per runtime (glibc pre-relocates
- * them, bionic does not) and ARM64 system libs carry MTE-tagged
- * pointers; hand-parsing them from app code is untestable remotely and
- * not worth the tombstones. Do not resurrect it.)
- *
- * The VM pointer is a process singleton; the first successful capture
- * serves every decoder thread. Capture is retried per hw init and never
- * latches, so the plugin arming later in startup is picked up by the
- * next session. */
-#include <dlfcn.h>
-#include <jni.h>
-
-/* Not static: android_video.c consumes the captured VM via an extern
- * declaration (SurfaceTexture ctor needs JNIEnv). */
-JavaVM *gdwaypipe_android_jvm = NULL;
-
-typedef jint (*get_created_vms_fn)(JavaVM **, jsize, jsize *);
-
-JNIEXPORT jint JNI_OnLoad(JavaVM *vm, void *reserved)
-{
-	(void)reserved;
-	gdwaypipe_android_jvm = vm;
-	DIAG_VIDEO_LOG("[hw-init] JNI_OnLoad ran; JavaVM=%p captured\n",
-			(void *) vm);
-	return JNI_VERSION_1_6;
-}
-
-/* Entry point for the panelspace JvmArm Godot Android plugin shim
- * (android-plugins/jvm-arm): its own JNI_OnLoad captured the JavaVM and it
- * dlopen()s this exact library file to call this symbol. Explicit C
- * export — visibility("default") survives -fvisibility=hidden builds; the
- * RTLD_NOW undefined-symbol guard only cares about imports. */
-__attribute__((visibility("default")))
-void gdwaypipe_arm_jvm(void *vm)
-{
-	if (vm == NULL) {
-		return;
-	}
-	gdwaypipe_android_jvm = (JavaVM *) vm;
-	DIAG_VIDEO_LOG("[hw-init] JavaVM=%p armed by JvmArm plugin (gdwaypipe_arm_jvm)\n",
-			vm);
-}
-
-static void gdwaypipe_capture_jvm(void)
-{
-	get_created_vms_fn get_created_vms =
-			(get_created_vms_fn) dlsym(RTLD_DEFAULT,
-					"JNI_GetCreatedJavaVMs");
-	if (get_created_vms == NULL) {
-		void *lib = dlopen("libjvm.so", RTLD_NOW | RTLD_NOLOAD);
-		if (lib != NULL) {
-			get_created_vms = (get_created_vms_fn) dlsym(lib,
-					"JNI_GetCreatedJavaVMs");
-		}
-	}
-	if (get_created_vms == NULL) {
-		void *lib = dlopen("libart.so", RTLD_NOW | RTLD_NOLOAD);
-		if (lib != NULL) {
-			get_created_vms = (get_created_vms_fn) dlsym(lib,
-					"JNI_GetCreatedJavaVMs");
-		}
-	}
-	if (get_created_vms == NULL) {
-		DIAG_VIDEO_LOG("[hw-init] FAIL JNI_GetCreatedJavaVMs unresolved (namespace-restricted runtime); awaiting JvmArm plugin arm\n");
-		return;
-	}
-	JavaVM *vms[1];
-	jsize n_created = 0;
-	if (get_created_vms(vms, 1, &n_created) != JNI_OK ||
-			n_created < 1 || vms[0] == NULL) {
-		DIAG_VIDEO_LOG("[hw-init] FAIL JNI_GetCreatedJavaVMs returned no VM; awaiting JvmArm plugin\n");
-		return;
-	}
-	gdwaypipe_android_jvm = vms[0];
-	DIAG_VIDEO_LOG("[hw-init] JavaVM=%p captured via JNI_GetCreatedJavaVMs\n",
-			(void *) vms[0]);
-}
-#endif
 
 #if !defined(HAS_VIDEO) || !defined(HAS_DMABUF)
 
@@ -202,18 +92,13 @@ void apply_video_packet(struct shadow_fd *sfd, struct render_data *rd,
 #else /* HAS_VIDEO */
 
 #include <libavcodec/avcodec.h>
-#ifdef __ANDROID__
-#include <libavcodec/jni.h>
-/* AVMediaCodecBuffer + av_mediacodec_release_buffer (surface-mode
- * drain, design §4.1). */
-#include <libavcodec/mediacodec.h>
-#endif
 #include <libavutil/display.h>
 #include <libavutil/hwcontext_drm.h>
 #include <libavutil/imgutils.h>
 #include <libavutil/log.h>
 #include <libavutil/opt.h>
 #include <libavutil/pixdesc.h>
+#include <stdatomic.h>
 #include <libswscale/swscale.h>
 #include <unistd.h>
 
@@ -481,6 +366,34 @@ bool video_supports_coding_format(enum video_coding_fmt fmt)
 	       get_video_decoder(fmt, false, false);
 }
 
+#ifdef __ANDROID__
+/* Live MediaCodec decoder-context cap. The Venus/OMX admission
+ * controller hard-fails session creation once concurrent decoders
+ * exceed the device MBPS budget (device evidence 2026-09-07:
+ * 'H/W is overloaded. needed: 9958195 max: 7833600' with only two
+ * 1506x806-class h264d instances; the operating-rate reservation
+ * inflates the count). Overflow sfds decode with the native software
+ * decoder until a slot frees. Multiple host sessions each run their
+ * own decoder thread, so the counter is atomic. */
+#define VIDEO_HW_ACTIVE_MAX 3
+static _Atomic int g_video_hw_active;
+
+static bool video_hw_slot_available(void)
+{
+	return atomic_load(&g_video_hw_active) < VIDEO_HW_ACTIVE_MAX;
+}
+
+/* Free the sfd's AVCodecContext, releasing its hw slot when the
+ * context carries a hardware device reference. */
+static void video_free_decode_context(struct shadow_fd *sfd)
+{
+	if (sfd->video_context && sfd->video_context->hw_device_ctx) {
+		atomic_fetch_sub(&g_video_hw_active, 1);
+	}
+	avcodec_free_context(&sfd->video_context);
+}
+#endif
+
 static void video_log_callback(
 		void *aux, int level, const char *fmt, va_list args)
 {
@@ -730,21 +643,12 @@ void destroy_video_data(struct shadow_fd *sfd)
 		/* free contexts (which, theoretically, could have hooks into
 		 * frames/packets) first */
 #ifdef __ANDROID__
-		if (sfd->video_android) {
-			/* Surface-mode decode: the AVCodecContext is owned
-			 * by the decoder pool (android_video.c) — freeing it
-			 * here would destroy a MediaCodec instance the pool
-			 * means to reuse. Detach and release instead: the
-			 * pool flushes the entry and marks it IDLE (design
-			 * §5.5); av_android_pool_release also frees and
-			 * NULLs sfd->video_android. */
-			sfd->video_context = NULL;
-			av_android_pool_release(sfd, false);
-		} else
-#endif
+		video_free_decode_context(sfd);
+#else
 		{
 			avcodec_free_context(&sfd->video_context);
 		}
+#endif
 		sws_freeContext(sfd->video_color_context);
 		if (sfd->video_yuv_frame_data) {
 			av_freep(sfd->video_yuv_frame_data);
@@ -753,20 +657,10 @@ void destroy_video_data(struct shadow_fd *sfd)
 			av_freep(sfd->video_local_frame_data);
 		}
 		av_frame_free(&sfd->video_local_frame);
-		av_frame_free(&sfd->video_tmp_frame);
 		av_frame_free(&sfd->video_last_frame);
 		av_frame_free(&sfd->video_yuv_frame);
 		av_packet_free(&sfd->video_packet);
 	}
-#ifdef __ANDROID__
-	else if (sfd->video_android) {
-		/* Pool bound but the context pointer already detached (e.g.
-		 * teardown raced a blit-failure rebind): still drop the
-		 * pool binding so the per-sfd EGLImage/FBO target is
-		 * released. */
-		av_android_pool_release(sfd, false);
-	}
-#endif
 #ifdef __ANDROID__
 	av_freep(&sfd->video_hw_extradata);
 	sfd->video_hw_extradata_size = 0;
@@ -835,62 +729,27 @@ static int init_hwcontext(struct render_data *rd)
 {
 #ifdef __ANDROID__
 	/* Android has no /dev/dri render node and no VAAPI; hardware decode
-	 * runs through ffmpeg's MediaCodec decoders. If hardware video was
-	 * disabled at startup, take the software branch deterministically
-	 * (has_hw = false) as before. */
+	 * runs through ffmpeg's MediaCodec decoders on a surface-less
+	 * (ByteBuffer-mode) device: decoded frames come out as plain CPU
+	 * NV12 frames and the existing sws_scale path applies directly.
+	 * Decoders are opened with ndk_codec=1 (see setup_video_decode):
+	 * ffmpeg's NDK wrapper dlopens libmediandk.so and needs no JavaVM
+	 * and no JNI on this thread — the former JNI wrapper demanded a
+	 * JVM (JvArm plugin, ART attach-before-EGL ordering) for a
+	 * surface-mode pipeline this module no longer contains. */
 	if (rd->av_disabled) {
 		return -1;
 	}
 	if (rd->av_hwdevice_ref != NULL) {
 		return 0;
 	}
-	/* The process JavaVM must be handed to ffmpeg before any MediaCodec
-	 * decoder is opened; without it decoder init fails. Capture is lazy
-	 * (first hw init) — see gdwaypipe_capture_jvm above. A failed capture
-	 * deliberately does NOT latch av_disabled: the JvmArm plugin's
-	 * System.load (JNI_OnLoad) may arm the VM later, so every
-	 * setup_video_decode retries; software decode serves meanwhile. The
-	 * JVM can only be set once, so a repeated registration with the same
-	 * VM (AVERROR(EEXIST)) counts as success too. */
-	if (gdwaypipe_android_jvm == NULL) {
-		gdwaypipe_capture_jvm();
-	}
-	if (gdwaypipe_android_jvm == NULL) {
-		return -1;
-	}
-	{
-		int jerr = av_jni_set_java_vm(gdwaypipe_android_jvm, NULL);
-		if (jerr < 0 && jerr != AVERROR(EEXIST)) {
-			DIAG_VIDEO_LOG("[hw-init] FAIL av_jni_set_java_vm: %s (software decode)\n",
-					av_err2str(jerr));
-			rd->av_disabled = true;
-			return -1;
-		}
-	}
-	if (!av_android_sw_forced()) {
-		/* Pool mode (design §5): the JVM above is all the global
-		 * state needed here — android_video.c creates one
-		 * surface-mode MEDIACODEC hw device per pool entry with
-		 * hwctx->native_window set (design §1.2b), so no shared
-		 * rd->av_hwdevice_ref is created. Pool/EGL failures are
-		 * per-sfd and handled at av_android_pool_setup time. */
-		DIAG_VIDEO_LOG("[hw-init] ok JavaVM=%p; surface-mode pool decode\n",
-				(void *) gdwaypipe_android_jvm);
-		return 0;
-	}
-	/* DEPRECATED: Android CPU decode path, remove after surface-mode
-	 * soak (see android-hw-decode-design.md §13). A surface-less
-	 * MediaCodec device runs the decoders in ByteBuffer mode, so
-	 * decoded frames come out as plain CPU frames (NV12) and the
-	 * existing sws_scale path applies directly. Reachable only when
-	 * GDWAYPIPE_ANDROID_SW=1 forces the legacy ladder. */
 	if (av_hwdevice_ctx_create(&rd->av_hwdevice_ref,
 			AV_HWDEVICE_TYPE_MEDIACODEC, NULL, NULL, 0) < 0) {
 		DIAG_VIDEO_LOG("[hw-init] FAIL av_hwdevice_ctx_create(MEDIACODEC); software decode\n");
 		rd->av_disabled = true;
 		return -1;
 	}
-	DIAG_VIDEO_LOG("[hw-init] ok MediaCodec hw device created\n");
+	DIAG_VIDEO_LOG("[hw-init] ok MediaCodec hw device created (ByteBuffer mode)\n");
 	return 0;
 #else
 	if (rd->av_disabled) {
@@ -1460,32 +1319,23 @@ static int h264_extract_ps_extradata(const uint8_t *data, int size,
 	return off;
 }
 
-/* Upgrade a software-opened decoder to MediaCodec surface mode once a
- * packet carries both SPS and PPS (h264_mediacodec needs them as
- * extradata at avcodec_open2; the stream only delivers them in-band).
- *
- * Pool mode (default, design §5.4): the extracted blob is handed to
- * av_android_pool_setup, which opens the first h264 pool entry with it
- * or rebinds an already-open entry (flush-only rebind; in-band
- * parameter sets suffice once MediaCodec is running, so the blob is
- * unused there). The returned context is pool-owned — it is never
- * freed here, and teardown goes through av_android_pool_release. The
- * still-live software context is only freed after a successful
- * acquire, so a pool failure keeps decoding on the current software
- * decoder and the video_hw_upgrade_failed latch stops further
- * attempts for this sfd (fallback ladder rung 3/5).
- *
- * Legacy CPU path (GDWAYPIPE_ANDROID_SW=1, design §13): the old
- * ByteBuffer-mode open below, which on failure latches
- * video_hw_upgrade_failed and rebuilds the software context so
- * decoding continues. */
+/* Upgrade a software-opened decoder to MediaCodec (ByteBuffer mode)
+ * once a packet carries both SPS and PPS (h264_mediacodec needs them
+ * as extradata at avcodec_open2; the stream only delivers parameter
+ * sets in-band). Any open failure latches video_hw_upgrade_failed and
+ * rebuilds the software context so decoding continues; a full hw-slot
+ * budget only defers the attempt — video_hw_upgrade_pending stays set
+ * and a later packet retries once a teardown frees a slot. */
 static void try_hw_upgrade(struct shadow_fd *sfd, struct render_data *rd,
 		const uint8_t *data, int size)
 {
 	if (sfd->video_hw_upgrade_failed || !sfd->video_hw_upgrade_pending) {
 		return;
 	}
-	if (av_android_sw_forced() && !rd->av_hwdevice_ref) {
+	if (!rd->av_hwdevice_ref) {
+		return;
+	}
+	if (!video_hw_slot_available()) {
 		return;
 	}
 	uint8_t *ps = NULL;
@@ -1494,57 +1344,16 @@ static void try_hw_upgrade(struct shadow_fd *sfd, struct render_data *rd,
 		av_freep(&ps);
 		return;
 	}
-
-	if (!av_android_sw_forced()) {
-		/* Pool acquire (design §5.4): h264 first upgrade or
-		 * flush-only rebind of an already-open entry. */
-		struct AVCodecContext *pool_ctx = NULL;
-		int pool_err = av_android_pool_setup(sfd, rd, ps, ps_size,
-				&pool_ctx);
-		/* The pool copies the blob into its freshly opened codec
-		 * context; ownership stays with the caller either way.
-		 * Keep an sfd-lifetime copy for the software rebind seed
-		 * (android_demote_to_sw). */
-		av_freep(&sfd->video_hw_extradata);
-		sfd->video_hw_extradata = av_malloc(ps_size);
-		if (sfd->video_hw_extradata) {
-			memcpy(sfd->video_hw_extradata, ps, ps_size);
-			sfd->video_hw_extradata_size = ps_size;
-		}
-		av_freep(&ps);
-		if (pool_err == 0) {
-			/* Swap in the pool's surface-mode context. The old
-			 * software context is ours — free it. video_yuv_frame
-			 * (an empty receive target) and video_packet (refilled
-			 * by apply_video_packet) carry over unchanged, so the
-			 * packet end-of-stream hazard noted in
-			 * apply_video_packet does not apply on this path.
-			 * Stream-change handling (design §5.3/§5.5): when the
-			 * pool rebound an already-open entry, that entry was
-			 * already flushed when it went IDLE at the previous
-			 * sfd's release (av_android_pool_release flushes
-			 * ACTIVE entries on the way to IDLE). Do NOT flush
-			 * again here: on Quest 2's OMX.qcom decoder the
-			 * post-open flush wedged the just-started instance
-			 * (every upgrade then failed at the first receive —
-			 * device evidence 2026-09-07 22:28:47, 'codec receive
-			 * failed' on 100% of upgrades). Flushing a freshly
-			 * opened entry is also pointless: nothing is in
-			 * flight. */
-			avcodec_free_context(&sfd->video_context);
-			sfd->video_context = pool_ctx;
-			sfd->video_hw_upgrade_pending = false;
-			DIAG_VIDEO_LOG("[decode-upgrade] ok RID=%d pool=1 extradata=%d bytes\n",
-					sfd->remote_id, ps_size);
-			return;
-		}
-		sfd->video_hw_upgrade_failed = true;
-		DIAG_VIDEO_LOG("[decode-upgrade] FAIL RID=%d pool err=%d; staying software\n",
-				sfd->remote_id, pool_err);
-		return;
+	/* Keep an sfd-lifetime copy for a mid-stream software rebind
+	 * (android_demote_to_sw seeds it — a blind rebind floods
+	 * 'non-existing PPS 0 referenced' until the next IDR, which never
+	 * comes on this stream). */
+	av_freep(&sfd->video_hw_extradata);
+	sfd->video_hw_extradata = av_malloc((size_t)ps_size);
+	if (sfd->video_hw_extradata) {
+		memcpy(sfd->video_hw_extradata, ps, (size_t)ps_size);
+		sfd->video_hw_extradata_size = ps_size;
 	}
-
-	/* Legacy CPU path (DEPRECATED, design §13) below. */
 
 	/* The color-conversion context is keyed to the coded frame
 	 * dimensions, which MediaCodec matches (see the coded-size policy
@@ -1569,6 +1378,11 @@ static void try_hw_upgrade(struct shadow_fd *sfd, struct render_data *rd,
 	ctx->delay = 0;
 	ctx->width = (int)sfd->dmabuf_info.width;
 	ctx->height = (int)sfd->dmabuf_info.height;
+	/* Force the pure-NDK MediaCodec wrapper (dlopens libmediandk):
+	 * no JavaVM and no JNI on the decoder thread. The AVOption default
+	 * (-1) would auto-select the JNI wrapper whenever any JavaVM is
+	 * registered process-wide. */
+	av_opt_set_int(ctx->priv_data, "ndk_codec", 1, 0);
 	/* Ownership of extradata passes to the AVCodecContext; ffmpeg
 	 * frees it in ff_codec_close. */
 	ctx->extradata = ps;
@@ -1605,6 +1419,7 @@ static void try_hw_upgrade(struct shadow_fd *sfd, struct render_data *rd,
 		setup_video_decode(sfd, rd);
 		return;
 	}
+	atomic_fetch_add(&g_video_hw_active, 1);
 	sfd->video_context = ctx;
 	sfd->video_yuv_frame = yuv;
 	sfd->video_packet = pkt;
@@ -1683,53 +1498,19 @@ int setup_video_decode(struct shadow_fd *sfd, struct render_data *rd)
 	}
 
 #ifdef __ANDROID__
-	if (has_hw && hw_supported && !av_android_sw_forced() &&
-			sfd->video_fmt != VIDEO_H264 &&
-			!sfd->video_hw_upgrade_failed) {
-		/* Pool direct open (design §5.4/§7): vp9 needs no
-		 * extradata, so acquire a surface-mode pool entry right
-		 * away — av_android_pool_setup opens a fresh MediaCodec
-		 * instance or rebinds + flushes an already-open one — and
-		 * skip the local software open entirely. The returned
-		 * context is pool-owned: never freed here; teardown goes
-		 * through av_android_pool_release (destroy_video_data). */
-		struct AVCodecContext *pool_ctx = NULL;
-		int pool_err = av_android_pool_setup(sfd, rd, NULL, 0,
-				&pool_ctx);
-		if (pool_err == 0) {
-			struct AVFrame *yuv_frame = av_frame_alloc();
-			struct AVPacket *pkt =
-					yuv_frame ? av_packet_alloc() : NULL;
-			if (!yuv_frame || !pkt) {
-				wp_error("Could not allocate video frame or packet");
-				av_frame_free(&yuv_frame);
-				av_packet_free(&pkt);
-				/* Rebinds were flushed when the entry went
-				 * IDLE at the previous sfd's release; do not
-				 * flush here — that wedges a freshly opened
-				 * OMX instance (see try_hw_upgrade). */
-				sfd->video_context = pool_ctx;
-				sfd->video_yuv_frame = yuv_frame;
-				sfd->video_packet = pkt;
-				sfd->video_yuv_frame_data = NULL;
-				/* will be allocated on frame receipt (SW
-				 * fallback only) */
-				sfd->video_local_frame = NULL;
-				sfd->video_color_context = NULL;
-				DIAG_VIDEO_LOG("[decode-setup] ok RID=%d pool=1 %dx%d drm_fmt=0x%x\n",
-						sfd->remote_id,
-						(int)sfd->dmabuf_info.width,
-						(int)sfd->dmabuf_info.height,
-						sfd->dmabuf_info.format);
-				return 0;
-			}
-		} else {
-			DIAG_VIDEO_LOG("[decode-setup] FAIL RID=%d pool err=%d; software ladder\n",
-					sfd->remote_id, pool_err);
-		}
-		/* Fallback ladder rung 4 (design §7): per-sfd software
-		 * fallback — reselect the native software decoder and
-		 * continue into the plain SW open below. */
+	if (has_hw && hw_supported && (sfd->video_hw_upgrade_failed ||
+			!video_hw_slot_available())) {
+		/* The hw-slot budget is full (resize storms open sibling
+		 * sfds before their predecessors release), or this sfd
+		 * latched off hardware after a codec death. Decode
+		 * software: h264 retries hardware via try_hw_upgrade
+		 * (pending stays set when only the budget was full);
+		 * vp9 has no extradata-driven upgrade and stays software
+		 * for this sfd's lifetime. */
+		DIAG_VIDEO_LOG("[decode-setup] RID=%d hw busy=%d failed=%d; software decode\n",
+				sfd->remote_id,
+				atomic_load(&g_video_hw_active),
+				sfd->video_hw_upgrade_failed ? 1 : 0);
 		has_hw = false;
 		hw_supported = false;
 		codec = get_video_decoder(sfd->video_fmt, false, false);
@@ -1806,38 +1587,19 @@ int setup_video_decode(struct shadow_fd *sfd, struct render_data *rd)
 	}
 
 	if (has_hw && hw_supported) {
-#ifdef __ANDROID__
-		if (!av_android_sw_forced()) {
-			/* Pool mode: rd->av_hwdevice_ref is intentionally
-			 * NULL (no shared surface-less device, design §5);
-			 * surface-mode contexts come from the pool. This spot
-			 * is only reached when the pool path was skipped or
-			 * failed — i.e. h264 with the video_hw_upgrade_failed
-			 * latch — so decode software for this sfd. */
+		ctx->hw_device_ctx = av_buffer_ref(rd->av_hwdevice_ref);
+		if (!ctx->hw_device_ctx) {
+			wp_error("Failed to reference hardware device context");
 			has_hw = false;
 			hw_supported = false;
-			avcodec_free_context(&ctx);
-			codec = get_video_decoder(sfd->video_fmt, false,
-					false);
-			if (!codec) {
-				return -1;
-			}
-			ctx = avcodec_alloc_context3(codec);
-			if (!ctx) {
-				wp_error("Failed to allocate context");
-				return -1;
-			}
-		} else
+		} else {
+			ctx->get_format = get_decode_format;
+#ifdef __ANDROID__
+			/* Force the pure-NDK MediaCodec wrapper (dlopens
+			 * libmediandk): no JavaVM and no JNI on the decoder
+			 * thread — see try_hw_upgrade. */
+			av_opt_set_int(ctx->priv_data, "ndk_codec", 1, 0);
 #endif
-		{
-			ctx->hw_device_ctx = av_buffer_ref(rd->av_hwdevice_ref);
-			if (!ctx->hw_device_ctx) {
-				wp_error("Failed to reference hardware device context");
-				has_hw = false;
-				hw_supported = false;
-			} else {
-				ctx->get_format = get_decode_format;
-			}
 		}
 	}
 
@@ -1892,6 +1654,11 @@ int setup_video_decode(struct shadow_fd *sfd, struct render_data *rd)
 			return -1;
 		}
 	}
+#ifdef __ANDROID__
+	if (ctx->hw_device_ctx) {
+		atomic_fetch_add(&g_video_hw_active, 1);
+	}
+#endif
 
 	struct AVFrame *yuv_frame = av_frame_alloc();
 	if (!yuv_frame) {
@@ -2085,8 +1852,17 @@ static int setup_color_conv(struct shadow_fd *sfd, struct AVFrame *cpu_frame)
 		local_frame->width = ctx->width;
 		local_frame->height = ctx->height;
 	}
+	/* Allocate with 16 columns of horizontal padding: the vendored
+	 * ffmpeg's aarch64 unscaled NEON converters (enabled for arbitrary
+	 * widths — see libswscale/aarch64/swscale_unscaled.c) may write up
+	 * to 60 bytes past width*4 at the end of each destination row, so
+	 * every row needs >=64 bytes of slack beyond width*4. Only the
+	 * ALLOCATION is padded; the frame keeps the real decoded width so
+	 * the sws context, the fixed-size mismatch guard, and
+	 * copy_from_video_mirror all see the true dimensions. */
+	int pad_w = local_frame->width + 16;
 	if (av_image_alloc(local_frame->data, local_frame->linesize,
-			    local_frame->width, local_frame->height, avpixfmt,
+			    pad_w, local_frame->height, avpixfmt,
 			    64) < 0) {
 		wp_error("Failed to allocate local image");
 		av_frame_free(&local_frame);
@@ -2111,18 +1887,17 @@ static int setup_color_conv(struct shadow_fd *sfd, struct AVFrame *cpu_frame)
 	return 0;
 }
 #ifdef __ANDROID__
-/* A pool-bound codec died mid-stream (device evidence 2026-09-07: Venus
- * HW overload kills OMX instances; the sfd then floods errors and shows a
- * stale, never-blitted black AHB forever). Demote the sfd to the software
- * ladder — same teardown shape as the blit-failure path. */
+/* The hw codec died mid-stream (device evidence 2026-09-07: Venus HW
+ * overload kills OMX instances; the sfd then floods errors and shows a
+ * stale black AHB forever). Demote the sfd to the software ladder and
+ * seed the fresh decoder with the cached SPS/PPS. */
 static void android_demote_to_sw(struct shadow_fd *sfd,
 		struct render_data *rd, const char *why)
 {
 	DIAG_VIDEO_LOG("[decode-upgrade] FAIL RID=%d %s; rebinding software\n",
 			sfd->remote_id, why);
-	sfd->video_context = NULL;
-	av_android_pool_release(sfd, false);
 	sfd->video_hw_upgrade_failed = true;
+	video_free_decode_context(sfd);
 	av_frame_free(&sfd->video_yuv_frame);
 	av_packet_free(&sfd->video_packet);
 	sfd->video_yuv_frame_data = NULL;
@@ -2192,14 +1967,15 @@ void apply_video_packet(struct shadow_fd *sfd, struct render_data *rd,
 		sfd->video_packet->pts =
 				(int64_t)(++video_pts_seq * 1000);
 	}
-
+	int64_t expected_pts = sfd->video_packet->pts;
 	int sendstat = avcodec_send_packet(
 			sfd->video_context, sfd->video_packet);
 	if (sendstat < 0) {
 		wp_error("Failed to send packet: %s", av_err2str(sendstat));
 #ifdef __ANDROID__
-		if (sfd->video_android && sendstat != AVERROR(EAGAIN)) {
-			/* Dead/failed pool codec (e.g. Venus HW overload);
+		if (sfd->video_context->hw_device_ctx &&
+				sendstat != AVERROR(EAGAIN)) {
+			/* Dead/failed hw codec (e.g. Venus HW overload);
 			 * EAGAIN is mere backpressure — never demote on it. */
 			android_demote_to_sw(sfd, rd, "codec send failed");
 			return;
@@ -2222,10 +1998,10 @@ void apply_video_packet(struct shadow_fd *sfd, struct render_data *rd,
 		wp_error("Could not allocate last-frame holder");
 		return;
 	}
+	int64_t drain_deadline_us = wp_lat_now_us() + 25000;
 #if !HAS_VAAPI
 	(void)rd;
 #endif
-	bool last_is_hw = false;
 	bool last_is_vaapi = false;
 	int have_frame = 0;
 	while (true) {
@@ -2237,10 +2013,47 @@ void apply_video_packet(struct shadow_fd *sfd, struct render_data *rd,
 						av_err2str(recvstat));
 			}
 #ifdef __ANDROID__
-			if (sfd->video_android) {
+			if (recvstat != AVERROR(EAGAIN) &&
+					sfd->video_context->hw_device_ctx) {
+				/* Dead/failed hw codec (e.g. Venus HW
+				 * overload killed the instance). EAGAIN is
+				 * NORMAL backpressure — a freshly opened
+				 * MediaCodec produces its first output only
+				 * a few ms after the first input, and
+				 * demoting on it was the R6 "100% demotion"
+				 * device failure. */
 				android_demote_to_sw(sfd, rd,
 						"codec receive failed");
 				return;
+			}
+#endif
+#ifdef __ANDROID__
+			if (recvstat == AVERROR(EAGAIN) &&
+					sfd->video_context->hw_device_ctx &&
+					sfd->video_last_frame->pts !=
+							AV_NOPTS_VALUE &&
+					sfd->video_last_frame->pts <
+							expected_pts &&
+					wp_lat_now_us() < drain_deadline_us) {
+				/* MediaCodec's output pipeline releases packet
+				 * k's frame during packet k+1's receive:
+				 * mediacodec_decode_receive polls output with
+				 * timeout 0 after queueing input and only
+				 * blocks (8 ms) when the input port is full.
+				 * The commit for frame k follows packet k on
+				 * the channel and is displayed straight from
+				 * this sfd's dmabuf — returning without frame
+				 * k makes the compositor present the previous
+				 * frame, and with double-buffered streams
+				 * (independent per-buffer decoders) the
+				 * visible sequence oscillates backwards and
+				 * forwards (device evidence 2026-09-08:
+				 * chromium video 'going back and forth').
+				 * Bounded wait: a genuinely slow codec
+				 * degrades to one-commit-behind instead of
+				 * stalling the channel thread. */
+				usleep(2000);
+				continue;
 			}
 #endif
 			break;
@@ -2255,162 +2068,50 @@ void apply_video_packet(struct shadow_fd *sfd, struct render_data *rd,
 			run_vaapi_conversion(
 					sfd, rd, sfd->video_yuv_frame);
 			last_is_vaapi = true;
-			last_is_hw = false;
 			continue;
 		}
 #endif
-#ifdef __ANDROID__
-		if (sfd->video_android &&
-				sfd->video_yuv_frame->format ==
-						AV_PIX_FMT_MEDIACODEC) {
-			/* Surface mode (pool bound, design §4.1): hold the
-			 * newest MEDIACODEC frame by reference exactly like a
-			 * software frame; its data[3] AVMediaCodecBuffer is
-			 * consumed after the drain by av_android_blit_latest.
-			 * NOTE: format alone identifies these frames — vendored
-			 * mediacodecdec_common.c sets data[3] but NEVER
-			 * hw_frames_ctx on surface-mode output, so a
-			 * hw_frames_ctx requirement here silently routed every
-			 * hw frame into the sws path (which cannot read
-			 * MEDIACODEC frames), dropping all decoded output.
-			 * A pool-bound surface-mode context emits ONLY
-			 * MEDIACODEC frames, and the deferred-SW context never
-			 * does, so format is an unambiguous discriminator.
-			 * A previously held surface frame (from this drain or
-			 * an earlier packet) is dropped with an explicit
-			 * render=0 release before the ref swap: the
-			 * free-callback backstop then no-ops because
-			 * av_mediacodec_release_buffer latches
-			 * buffer->released. The backstop always releases with
-			 * render=0 and must never be the render path — every
-			 * buffer is released explicitly here or by the blit,
-			 * so MediaCodec's output queue can never deadlock. */
-			AVMediaCodecBuffer *old_buf = NULL;
-			if (sfd->video_last_frame->format ==
-					AV_PIX_FMT_MEDIACODEC) {
-				old_buf = (AVMediaCodecBuffer *)
-						sfd->video_last_frame->data[3];
-			}
-			if (old_buf) {
-				av_mediacodec_release_buffer(old_buf, 0);
-			}
-			/* av_frame_ref does not unref its destination (the
-			 * vendored n6.1 implementation asserts dst is empty),
-			 * so drop the previous hold first — otherwise its
-			 * AVBufferRefs (including the MEDIACODEC buffer
-			 * wrapper ref that drives the free-callback
-			 * backstop) leak on every swap. */
-			av_frame_unref(sfd->video_last_frame);
-			if (av_frame_ref(sfd->video_last_frame,
-					    sfd->video_yuv_frame) < 0) {
-				wp_error("Failed to reference last frame");
-				return;
-			}
-			last_is_hw = true;
-			last_is_vaapi = false;
-			continue;
+		if (sfd->video_yuv_frame->format == AV_PIX_FMT_MEDIACODEC) {
+			/* Surface-mode frames carry no CPU pixels and no
+			 * hw_frames_ctx; this module builds only the
+			 * surface-less (ByteBuffer) ladder, which emits
+			 * plain NV12 frames. A MEDIACODEC frame here means
+			 * the get_format hook selected a surface-mode
+			 * context — fail loudly (AGENTS rule) instead of
+			 * routing unreadable planes into sws_scale. */
+			wp_error("MEDIACODEC frame reached the software path (RID=%d)",
+					sfd->remote_id);
+			return;
 		}
-#endif
-		if (sfd->video_yuv_frame->hw_frames_ctx != NULL &&
-				sfd->video_yuv_frame->format ==
-						AV_PIX_FMT_MEDIACODEC) {
-			/* DEPRECATED: Android CPU decode path, remove after
-			 * surface-mode soak (see android-hw-decode-design.md
-			 * §13). Only reachable when GDWAYPIPE_ANDROID_SW=1
-			 * forces the legacy ladder — in pool mode the branch
-			 * above owns every MEDIACODEC frame. True hw frames do
-			 * not survive the next receive; transfer the pixels
-			 * out per-frame. Only true hw frames carry
-			 * hw_frames_ctx: surface-less MediaCodec (ByteBuffer
-			 * mode) emits plain software NV12 frames
-			 * (hw_frames_ctx NULL), which must go through the
-			 * normal path below. */
-			if (!sfd->video_tmp_frame &&
-			    !(sfd->video_tmp_frame = av_frame_alloc())) {
-				wp_error("Failed to allocate temporary frame");
-				return;
-			}
-			int tferr = av_hwframe_transfer_data(
-					sfd->video_tmp_frame,
-					sfd->video_yuv_frame, 0);
-			if (tferr < 0) {
-				wp_error("Failed to transfer hwframe data: %s",
-						av_err2str(tferr));
-				return;
-			}
-			last_is_hw = true;
-			last_is_vaapi = false;
-			continue;
-		}
-		/* Software frame: hold the newest by reference. av_frame_ref
-		 * does not unref its destination (see the pool branch
-		 * above), so drop the previous hold first — this also fixes
-		 * the pre-existing ref leak on the Linux software path. */
+		/* Software frame: hold the newest by reference.
+		 * av_frame_ref does not unref its destination, so drop
+		 * the previous hold first — this also fixes the
+		 * pre-existing ref leak on the Linux software path. */
 		av_frame_unref(sfd->video_last_frame);
 		if (av_frame_ref(sfd->video_last_frame,
 				    sfd->video_yuv_frame) < 0) {
 			wp_error("Failed to reference last frame");
 			return;
 		}
-		last_is_hw = false;
 		last_is_vaapi = false;
+#ifdef __ANDROID__
+		if (sfd->video_context->hw_device_ctx &&
+				sfd->video_last_frame->pts != AV_NOPTS_VALUE &&
+				sfd->video_last_frame->pts >= expected_pts) {
+			/* Presentation-order invariant: stop draining as soon
+			 * as this packet's frame is in hand — later frames
+			 * stay queued in the codec so each commit presents
+			 * exactly its own frame instead of racing ahead. */
+			break;
+		}
+#endif
 	}
 	if (!have_frame || last_is_vaapi) {
 		/* Nothing decoded, or the newest frame was already handled
 		 * by the per-frame VAAPI conversion. */
 		return;
 	}
-#ifdef __ANDROID__
-	/* Format check only: surface-mode MEDIACODEC frames carry no
-	 * hw_frames_ctx (see the drain comment above), so last_is_hw —
-	 * which the drain sets from the same faulty test — must not gate
-	 * the present path. A pool-bound context only ever produces
-	 * MEDIACODEC frames. */
-	if (sfd->video_android &&
-			sfd->video_last_frame->format ==
-					AV_PIX_FMT_MEDIACODEC) {
-		/* Surface-mode present (design §4.1): instead of sws+copy,
-		 * present the newest decoded frame by blitting it into the
-		 * sfd's BGRA AHardwareBuffer (release render=1 →
-		 * updateTexImage → OES crop-rect blit → glFinish). The
-		 * bracket below keeps the existing telemetry shape: the
-		 * recorded span now covers the whole present cost, so the
-		 * pool's internal lat_us out-param stays unused (NULL). */
-		if (lat_video_on) {
-			lat_f0 = wp_lat_now_us();
-		}
-		int blit_err = av_android_blit_latest(sfd,
-				sfd->video_last_frame, NULL);
-		if (lat_video_on) {
-			wp_lat_video_record(&g_lat_video,
-					wp_lat_now_us() - lat_f0);
-		}
-		/* The blit consumed the frame's AVMediaCodecBuffer
-		 * (render=1 on success, render=0 on failure — the failure
-		 * release happens inside av_android_blit_latest), so
-		 * dropping our reference cannot double-release it. */
-		av_frame_unref(sfd->video_last_frame);
-		if (blit_err < 0) {
-			/* Fallback ladder rung 6 (design §7): per-sfd SW
-			 * fallback. The pool latched the entry DEAD inside
-			 * the failed blit; av_android_pool_release tears such
-			 * an entry down even with destroy_entry=false. The
-			 * video_hw_upgrade_failed latch stops any further
-			 * pool acquire for this sfd. The frame is lost (its
-			 * buffer was released render=0), and the packet that
-			 * produced it was already consumed by the hw decoder;
-			 * the demotion mirrors the blit-failure rung-6 path. */
-			char why[48];
-			snprintf(why, sizeof(why), "blit err=%d", blit_err);
-			android_demote_to_sw(sfd, rd, why);
-		}
-		return;
-	}
-#endif
-
-	struct AVFrame *cpu_frame = last_is_hw
-			? sfd->video_tmp_frame
-			: sfd->video_last_frame;
+	struct AVFrame *cpu_frame = sfd->video_last_frame;
 	if (!cpu_frame) {
 		return;
 	}
