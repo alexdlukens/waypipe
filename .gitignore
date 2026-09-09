@@ -15,3 +15,5 @@
 
 # scons object files
 *.os
+*.o
+*.os
