@@ -245,6 +245,10 @@ struct shadow_fd {
 	struct SwsContext *video_color_context;
 	int64_t video_frameno;
 	enum video_coding_fmt video_fmt;
+	/* GDWAYPIPE_RED_FILL=1 debug mode: per-surface "mirror already
+	 * filled red and pushed to the dmabuf" marker. shadow_fd is
+	 * calloc'd in shadow.c, so this starts false. */
+	bool video_red_fill_done;
 
 	VASurfaceID video_va_surface;
 

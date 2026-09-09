@@ -35,6 +35,22 @@ static int wp_lat_enabled(void)
 	return en;
 }
 
+/* Cached one-time env read; GDWAYPIPE_RED_FILL=1 enables the debug
+ * "red fill" decode bypass (video.c): per surface the CPU mirror is
+ * filled solid red and pushed to the dmabuf once, then every video
+ * packet returns immediately with no decode/conversion work. */
+static int wp_red_fill_enabled(void)
+{
+	static int once = 0;
+	static int en = 0;
+	if (!once) {
+		once = 1;
+		const char *e = getenv("GDWAYPIPE_RED_FILL");
+		en = (e && e[0] == '1') ? 1 : 0;
+	}
+	return en;
+}
+
 static int64_t wp_lat_now_us(void)
 {
 	struct timespec ts;

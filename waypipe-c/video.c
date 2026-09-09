@@ -1528,6 +1528,148 @@ static int setup_color_conv(struct shadow_fd *sfd, struct AVFrame *cpu_frame)
 }
 
 
+/* GDWAYPIPE_RED_FILL=1 debug "red fill" mode: replaces the whole decode
+ * pipeline with a one-time solid-red fill, so frame latency can be A/B'd
+ * against network cost with no client-side decode/convert overhead.
+ *
+ * Strategy: the CPU mirror (video_local_frame) is allocated here in the
+ * dmabuf's own AV pixel format — the same format setup_color_conv uses
+ * (drm_to_av(dmabuf_info.format)) — sized to the real surface with the
+ * same +16-column padding convention. It is filled solid red via a
+ * single sws_scale from a temporary red-filled BGRA frame: one uniform
+ * path, byte-exact for packed RGB mirrors (e.g. XRGB8888 -> BGR0) and
+ * correct for planar/semi-planar YUV mirrors (NV12, YUV420P, ...) with
+ * no per-format byte-pattern table. The push to the dmabuf reuses the
+ * normal sync/map/copy_from_video_mirror/unmap sequence. Once done
+ * (video_red_fill_done), every subsequent packet returns immediately:
+ * per-frame work is zero decode, zero sws, zero copy; only the latency
+ * telemetry still runs. */
+static void red_fill_apply(struct shadow_fd *sfd)
+{
+	if (sfd->video_red_fill_done) {
+		return;
+	}
+	if (!sfd->dmabuf_bo) {
+		/* The dmabuf import (shadow.c) has not happened yet; the
+		 * next packet retries. Nothing to push into anyway. */
+		return;
+	}
+	if (sfd->dmabuf_info.width == 0 || sfd->dmabuf_info.height == 0) {
+		wp_error("red-fill: surface %ux%u invalid for RID=%d",
+				sfd->dmabuf_info.width,
+				sfd->dmabuf_info.height, sfd->remote_id);
+		sfd->video_red_fill_done = true;
+		return;
+	}
+	enum AVPixelFormat avpixfmt = drm_to_av(sfd->dmabuf_info.format);
+	if (avpixfmt == AV_PIX_FMT_NONE) {
+		wp_error("red-fill: no AV pixel format for DRM 0x%x",
+				sfd->dmabuf_info.format);
+		sfd->video_red_fill_done = true;
+		return;
+	}
+
+	if (!sfd->video_local_frame) {
+		/* Decode is skipped, so the mirror that setup_color_conv
+		 * would normally create on first frame receipt must be
+		 * created here. Same allocation shape: real-size frame,
+		 * +16-column padded image, 64-aligned, recorded in
+		 * video_local_frame_data so destroy_video_data frees it. */
+		struct AVFrame *local_frame = av_frame_alloc();
+		if (!local_frame) {
+			wp_error("red-fill: could not allocate frame");
+			sfd->video_red_fill_done = true;
+			return;
+		}
+		local_frame->format = avpixfmt;
+		local_frame->width = (int)sfd->dmabuf_info.width;
+		local_frame->height = (int)sfd->dmabuf_info.height;
+		int pad_w = local_frame->width + 16;
+		if (av_image_alloc(local_frame->data,
+				    local_frame->linesize, pad_w,
+				    local_frame->height, avpixfmt, 64) < 0) {
+			wp_error("red-fill: failed to allocate local image");
+			av_frame_free(&local_frame);
+			sfd->video_red_fill_done = true;
+			return;
+		}
+		sfd->video_local_frame = local_frame;
+		sfd->video_local_frame_data = &local_frame->data[0];
+	}
+
+	/* One-time red fill: sws_scale from a temporary red BGRA frame
+	 * into the mirror's native format. */
+	struct AVFrame *red = av_frame_alloc();
+	if (!red) {
+		wp_error("red-fill: could not allocate red frame");
+		sfd->video_red_fill_done = true;
+		return;
+	}
+	red->format = AV_PIX_FMT_BGRA;
+	red->width = sfd->video_local_frame->width;
+	red->height = sfd->video_local_frame->height;
+	if (av_image_alloc(red->data, red->linesize, red->width,
+			    red->height, AV_PIX_FMT_BGRA, 64) < 0) {
+		wp_error("red-fill: failed to allocate red image");
+		av_frame_free(&red);
+		sfd->video_red_fill_done = true;
+		return;
+	}
+	/* BGRA red: byte order B=0, G=0, R=255, A=255 */
+	for (int r = 0; r < red->height; r++) {
+		uint8_t *row = red->data[0] + (size_t)red->linesize[0] * r;
+		for (int c = 0; c < red->width; c++) {
+			uint8_t *px = row + 4 * (size_t)c;
+			px[0] = 0;
+			px[1] = 0;
+			px[2] = 255;
+			px[3] = 255;
+		}
+	}
+	struct SwsContext *sws = sws_getContext(red->width, red->height,
+			AV_PIX_FMT_BGRA, sfd->video_local_frame->width,
+			sfd->video_local_frame->height, avpixfmt,
+			SWS_BILINEAR, NULL, NULL, NULL);
+	if (!sws) {
+		wp_error("red-fill: could not create conversion context");
+		av_freep(&red->data[0]);
+		av_frame_free(&red);
+		sfd->video_red_fill_done = true;
+		return;
+	}
+	if (sws_scale(sws, (const uint8_t *const *)red->data, red->linesize,
+			    0, red->height, sfd->video_local_frame->data,
+			    sfd->video_local_frame->linesize) < 0) {
+		wp_error("red-fill: conversion failed");
+	}
+	sws_freeContext(sws);
+	av_freep(&red->data[0]);
+	av_frame_free(&red);
+
+	/* Push once to the dmabuf: same sync-bracketed CPU write as the
+	 * normal frame path (see the B5 comment there). */
+	uint32_t map_stride = 0;
+	void *handle = NULL;
+	dmabuf_sync_start(sfd->fd_local, true);
+	void *data = map_dmabuf(sfd->dmabuf_bo, true, &handle, &map_stride);
+	if (!data) {
+		dmabuf_sync_end(sfd->fd_local, true);
+		wp_error("red-fill: dmabuf map failed for RID=%d",
+				sfd->remote_id);
+		sfd->video_red_fill_done = true;
+		return;
+	}
+	copy_from_video_mirror(data, map_stride, sfd->video_local_frame,
+			&sfd->dmabuf_info);
+	unmap_dmabuf(sfd->dmabuf_bo, handle);
+	dmabuf_sync_end(sfd->fd_local, true);
+
+	sfd->video_red_fill_done = true;
+	DIAG_VIDEO_LOG("[gdwaypipe-diag] red-fill: filled RID=%d %ux%u drm_fmt=0x%x once; decode bypassed per frame\n",
+			sfd->remote_id, sfd->dmabuf_info.width,
+			sfd->dmabuf_info.height, sfd->dmabuf_info.format);
+}
+
 void apply_video_packet(struct shadow_fd *sfd, struct render_data *rd,
 		const struct bytebuf *msg)
 {
@@ -1543,6 +1685,26 @@ void apply_video_packet(struct shadow_fd *sfd, struct render_data *rd,
 	}
 	int lat_video_on = wp_lat_enabled();
 	int64_t lat_f0 = 0;
+	if (wp_red_fill_enabled()) {
+		/* One-time mode announcement so the log shows which path
+		 * produced the frames. */
+		static int red_fill_announced = 0;
+		if (!red_fill_announced) {
+			red_fill_announced = 1;
+			DIAG_VIDEO_LOG("[gdwaypipe-diag] red-fill mode active (GDWAYPIPE_RED_FILL=1): per-frame decode/convert skipped\n");
+		}
+		if (lat_video_on) {
+			lat_f0 = wp_lat_now_us();
+		}
+		red_fill_apply(sfd);
+		if (lat_video_on) {
+			/* Keep the 1 Hz decode telemetry alive with the
+			 * (near-zero) fill-mode cost. */
+			wp_lat_video_record(&g_lat_video,
+					wp_lat_now_us() - lat_f0);
+		}
+		return;
+	}
 	sfd->video_packet->data = (uint8_t *)msg->data;
 	sfd->video_packet->size = (int)msg->size;
 
