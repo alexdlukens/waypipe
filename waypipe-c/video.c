@@ -119,6 +119,8 @@ void apply_video_packet(struct shadow_fd *sfd, struct render_data *rd,
 #include <gbm.h>
 #include "libyuv/row.h"
 #include "libyuv/convert_argb.h"
+#include <errno.h>
+#include <sys/mman.h>
 #endif
 
 #define VIDEO_H264_HW_ENCODER "h264_vaapi"
@@ -580,6 +582,10 @@ static void run_vaapi_conversion(struct shadow_fd *sfd, struct render_data *rd,
 
 void destroy_video_data(struct shadow_fd *sfd)
 {
+	if (sfd->video_direct_map) {
+		munmap(sfd->video_direct_map, sfd->video_direct_map_size);
+		sfd->video_direct_map = NULL;
+	}
 	if (sfd->video_context) {
 #ifdef HAS_VAAPI
 		cleanup_vaapi_pipeline(sfd);
@@ -1889,27 +1895,59 @@ void apply_video_packet(struct shadow_fd *sfd, struct render_data *rd,
 			if (lat_video_on) {
 				lat_f0 = wp_lat_now_us();
 			}
+			/* Persistent raw CPU mapping (latency plan
+			 * Option 2): created once on the first frame and
+			 * held for the surface's lifetime, removing the
+			 * per-frame AHardwareBuffer lockPlanes/unlock that
+			 * measurement showed dominates the frame cost
+			 * (direct conversion alone is ~2-4 ms). The B5
+			 * implicit-fence contract is preserved: every CPU
+			 * write is still bracketed by DMA_BUF_IOCTL_SYNC
+			 * below, exactly as the per-frame-lock path did. */
+			if (!sfd->video_direct_map) {
+				uint32_t stride = gbm_bo_get_stride(
+						sfd->dmabuf_bo);
+				size_t size = sfd->buffer_size
+						? (size_t)sfd->buffer_size
+						: (size_t)sfd->dmabuf_info
+								  .offsets[0] +
+						  (size_t)stride *
+							  sfd->dmabuf_info
+								  .height;
+				if (!stride || !size) {
+					wp_error("Cannot persistently map dmabuf: stride=%u size=%zu RID=%d",
+							stride, size,
+							sfd->remote_id);
+					return;
+				}
+				void *m = mmap(NULL, size,
+						PROT_READ | PROT_WRITE,
+						MAP_SHARED, sfd->fd_local, 0);
+				if (m == MAP_FAILED) {
+					wp_error("Persistent dmabuf mmap failed for RID=%d: %s",
+							sfd->remote_id,
+							strerror(errno));
+					return;
+				}
+				sfd->video_direct_map = m;
+				sfd->video_direct_map_stride = stride;
+				sfd->video_direct_map_size = size;
+				DIAG_VIDEO_LOG("[gdwaypipe-diag] video: persistent dmabuf map ok size=%zu stride=%u RID=%d\n",
+						size, stride, sfd->remote_id);
+			}
 			/* B5 contract, same as the sws path: bracket the CPU
 			 * write with DMA_BUF_IOCTL_SYNC so the implicit fence
 			 * orders it against the compositor sampling the
 			 * buffer. */
 			dmabuf_sync_start(sfd->fd_local, true);
-			uint32_t map_stride = 0;
-			void *handle = NULL;
-			char *data = map_dmabuf(sfd->dmabuf_bo, true, &handle,
-					&map_stride);
-			if (!data) {
-				dmabuf_sync_end(sfd->fd_local, true);
-				return;
-			}
 			i420_to_packed_rows(cpu_frame,
-					(uint8_t *)data +
-						sfd->dmabuf_info.offsets[0],
-					(int)map_stride,
+					(uint8_t *)sfd->video_direct_map +
+							sfd->dmabuf_info
+								.offsets[0],
+					(int)sfd->video_direct_map_stride,
 					(int)sfd->dmabuf_info.width,
 					(int)sfd->dmabuf_info.height,
 					mfmt == AV_PIX_FMT_RGB0);
-			unmap_dmabuf(sfd->dmabuf_bo, handle);
 			dmabuf_sync_end(sfd->fd_local, true);
 			if (lat_video_on) {
 				wp_lat_video_record(&g_lat_video,

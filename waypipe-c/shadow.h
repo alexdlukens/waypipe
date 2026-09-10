@@ -247,6 +247,14 @@ struct shadow_fd {
 	 * values). shadow_fd is calloc'd, so 0/0 = "no frame yet". */
 	int video_setup_width;
 	int video_setup_height;
+	/* Android libyuv direct path: persistent raw CPU mapping of the
+	 * surface's dmabuf (fd_local), created on the first converted
+	 * frame and held until destroy_video_data. Per-frame cost is only
+	 * the DMA_BUF_IOCTL_SYNC bracket — no AHardwareBuffer
+	 * lock/unlock. calloc'd, so NULL/0 = "not mapped yet". */
+	void *video_direct_map;
+	uint32_t video_direct_map_stride;
+	size_t video_direct_map_size;
 	struct AVPacket *video_packet;
 	struct SwsContext *video_color_context;
 	int64_t video_frameno;
