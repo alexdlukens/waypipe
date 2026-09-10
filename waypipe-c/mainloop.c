@@ -26,6 +26,23 @@
 #include "main.h"
 #include "latency.h"
 
+
+/* Frame-path trace (GDWAYPIPE_LATENCY, same gate as [gdwaypipe-lat]):
+ * one line per protocol batch crossing the decoder with CLOCK_MONOTONIC
+ * microseconds — the same clock gdwlroots' [ftrace] lines use (shared
+ * process), so commit-in / frame-done-out dwell through the decoder is
+ * directly measurable. wp_debug is compile-time/flag-gated and off on
+ * device; this stays on with telemetry. */
+static void ftrace(const char *event, int bytes)
+{
+	if (!wp_lat_enabled()) {
+		return;
+	}
+	int64_t us = wp_lat_now_us();
+	wp_lat_emit("[ftrace] t=%lld %s bytes=%d\n", (long long)us, event,
+			bytes);
+}
+
 #include <errno.h>
 #include <fcntl.h>
 #include <inttypes.h>
@@ -368,11 +385,12 @@ static int interpret_chanmsg(struct chan_msg_state *cmsg,
 		}
 		return 0;
 	} else if (type == WMSG_PROTOCOL) {
+		int protosize = (int)(unpadded_size - sizeof(uint32_t));
+		ftrace("chan_protocol_in", protosize);
 		/* While by construction, the provided message buffer should be
 		 * aligned with individual message boundaries, it is not
 		 * guaranteed that all file descriptors provided will be used by
 		 * the messages. This makes fd handling more complicated. */
-		int protosize = (int)(unpadded_size - sizeof(uint32_t));
 		wp_debug("Received WMSG_PROTOCOL with %d bytes of messages",
 				protosize);
 		// TODO: have message editing routines ensure size, so
@@ -677,6 +695,8 @@ static int advance_chanmsg_progwrite(struct chan_msg_state *cmsg, int progfd,
 	}
 	if (cmsg->proto_write.zone_start == cmsg->proto_write.zone_end) {
 		wp_debug("Write to the %s succeeded", progdesc);
+		ftrace("compositor_protocol_out",
+				cmsg->proto_write.zone_end);
 		cmsg->state = CM_WAITING_FOR_CHANNEL;
 		DTRACE_PROBE(waypipe, chanmsg_channel_wait);
 	}
@@ -944,6 +964,7 @@ static int advance_waymsg_chanwrite(struct way_msg_state *wmsg,
 
 		wp_debug("Sent %d-byte message from %s to channel; %zu-bytes in flight",
 				wmsg->total_written, progdesc, unacked_bytes);
+		ftrace("ssh_batch_out", wmsg->total_written);
 
 		/* do not delete the used transfers yet; we need a remote
 		 * acknowledgement */
@@ -982,6 +1003,7 @@ static int advance_waymsg_progread(struct way_msg_state *wmsg,
 			// We have successfully read some data.
 			wmsg->proto_read.zone_end += (int)rc;
 			new_proto_data = true;
+			ftrace("compositor_protocol_in", (int)rc);
 		}
 	}
 
