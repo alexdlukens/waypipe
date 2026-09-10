@@ -1907,13 +1907,26 @@ void apply_video_packet(struct shadow_fd *sfd, struct render_data *rd,
 			if (!sfd->video_direct_map) {
 				uint32_t stride = gbm_bo_get_stride(
 						sfd->dmabuf_bo);
-				size_t size = sfd->buffer_size
-						? (size_t)sfd->buffer_size
-						: (size_t)sfd->dmabuf_info
-								  .offsets[0] +
-						  (size_t)stride *
-							  sfd->dmabuf_info
-								  .height;
+				/* The mapping must cover the buffer's TRUE
+				 * row layout, not the wire's tight w*h*4
+				 * idea of it: gralloc pads rows (measured
+				 * 11264 B/row for a 2520-wide surface =
+				 * 2816 px), and the row loop below advances
+				 * dst by `stride`, so the last row ends at
+				 * offsets[0] + (height-1)*stride + width*4.
+				 * Mapping only buffer_size here undermaps by
+				 * (height-1)*(stride - width*4) bytes and
+				 * turns every frame into MBs of OOB writes
+				 * (the 09-09 tombstone). */
+				size_t size =
+						(size_t)sfd->dmabuf_info
+								.offsets[0] +
+						(size_t)stride *
+								sfd->dmabuf_info
+									.height;
+				if (sfd->buffer_size > size) {
+					size = sfd->buffer_size;
+				}
 				if (!stride || !size) {
 					wp_error("Cannot persistently map dmabuf: stride=%u size=%zu RID=%d",
 							stride, size,
