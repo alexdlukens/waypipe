@@ -130,8 +130,6 @@ void apply_video_packet(struct shadow_fd *sfd, struct render_data *rd,
 #define VIDEO_VP9_HW_ENCODER "vp9_vaapi"
 #define VIDEO_VP9_SW_ENCODER "libvpx-vp9"
 #define VIDEO_VP9_DECODER "vp9"
-#define VIDEO_H264_MC_DECODER "h264_mediacodec"
-#define VIDEO_VP9_MC_DECODER "vp9_mediacodec"
 
 /* librav1e currently is not sufficient as its low-latency mode doesn't
  * appear to entirely turn off lookahead, and a few frames of latency
@@ -341,29 +339,6 @@ static const struct AVCodec *get_video_decoder(
 		wp_error("Failed to find decoder \"%s\"", name);
 	}
 	return codec;
-}
-
-/* Android standalone MediaCodec decoders (built into the vendored ffmpeg
- * on __ANDROID__, see scripts/build-ffmpeg.sh FFMPEG_DECODERS). Unlike the
- * hwaccel path these are self-contained decoders: no hw_device_ctx and no
- * get_format, and in ByteBuffer mode they emit plain YUV420P CPU frames —
- * downstream (libyuv conversion, commit ordering) identical to the native
- * software decoders. */
-static const struct AVCodec *get_video_mc_decoder(
-		enum video_coding_fmt fmt)
-{
-	const char *name = NULL;
-	switch (fmt) {
-	case VIDEO_H264:
-		name = VIDEO_H264_MC_DECODER;
-		break;
-	case VIDEO_VP9:
-		name = VIDEO_VP9_MC_DECODER;
-		break;
-	default:
-		return NULL;
-	}
-	return avcodec_find_decoder_by_name(name);
 }
 
 bool video_supports_coding_format(enum video_coding_fmt fmt)
@@ -1200,21 +1175,7 @@ int setup_video_decode(struct shadow_fd *sfd, struct render_data *rd)
 		return -1;
 	}
 
-	bool has_hw = false;
-	bool mc_decoder = false;
-#if defined(__ANDROID__)
-	/* Android: init_hwcontext() is the Linux VAAPI device and always
-	 * fails here, so the Quest silently fell back to ffmpeg's NATIVE
-	 * software decoder — measured 17.0 ms/frame p50 (2026-09-11 run 14),
-	 * blocking the client mainloop inside avcodec_receive_frame for the
-	 * whole codec window. Prefer the MediaCodec decoders; native
-	 * software stays the fallback. */
-	mc_decoder = get_video_mc_decoder(sfd->video_fmt) != NULL;
-	has_hw = mc_decoder;
-#endif
-	if (!mc_decoder) {
-		has_hw = init_hwcontext(rd) == 0;
-	}
+	bool has_hw = init_hwcontext(rd) == 0;
 
 	enum AVPixelFormat avpixfmt = drm_to_av(sfd->dmabuf_info.format);
 	if (avpixfmt == AV_PIX_FMT_NONE) {
@@ -1233,19 +1194,18 @@ int setup_video_decode(struct shadow_fd *sfd, struct render_data *rd)
 		return -1;
 	}
 
-	const struct AVCodec *codec = mc_decoder
-			? get_video_mc_decoder(sfd->video_fmt)
-			: get_video_decoder(sfd->video_fmt, has_hw);
+	const struct AVCodec *codec =
+			get_video_decoder(sfd->video_fmt, has_hw);
 	if (!codec) {
 		return -1;
 	}
 
-	/* Determine whether the selected decoder can do hardware work. For
-	 * the Linux VAAPI path this probes the hwconfig; for the Android
-	 * MediaCodec standalone decoder it is simply true (no hw_device_ctx
-	 * or get_format needed). */
-	bool hw_supported = mc_decoder;
-	if (has_hw && !mc_decoder) {
+	/* Determine whether this build's decoder actually registers a VAAPI
+	 * hardware config. The vendored ffmpeg is configured
+	 * --disable-hwaccels, so it will not, and the HW path must be
+	 * skipped rather than attempted and failed. */
+	bool hw_supported = false;
+	if (has_hw) {
 		const enum AVHWDeviceType hwdev_type = AV_HWDEVICE_TYPE_VAAPI;
 		for (int i = 0;; i++) {
 			const AVCodecHWConfig *cfg =
@@ -1269,10 +1229,7 @@ int setup_video_decode(struct shadow_fd *sfd, struct render_data *rd)
 	}
 
 	ctx->delay = 0;
-	if (mc_decoder) {
-		/* Standalone MediaCodec decoder: configure like software; the
-		 * wrapper manages its own buffers and outputs YUV420P. */
-	} else if (has_hw && hw_supported) {
+	if (has_hw && hw_supported) {
 		/* If alignment permits, use hardware decoding */
 		if (!pad_hardware_size((int)sfd->dmabuf_info.width,
 					(int)sfd->dmabuf_info.height,
@@ -1292,7 +1249,7 @@ int setup_video_decode(struct shadow_fd *sfd, struct render_data *rd)
 		hw_supported = false;
 	}
 
-	if (has_hw && hw_supported && !mc_decoder) {
+	if (has_hw && hw_supported) {
 		ctx->hw_device_ctx = av_buffer_ref(rd->av_hwdevice_ref);
 		if (!ctx->hw_device_ctx) {
 			wp_error("Failed to reference hardware device context");
@@ -1303,7 +1260,7 @@ int setup_video_decode(struct shadow_fd *sfd, struct render_data *rd)
 		}
 	}
 
-	if (mc_decoder || !has_hw || !hw_supported) {
+	if (!has_hw || !hw_supported) {
 		ctx->pix_fmt = videofmt;
 		/* set context dimensions, and allocate buffer to write into */
 		ctx->width = (int)sfd->dmabuf_info.width;
@@ -1313,17 +1270,7 @@ int setup_video_decode(struct shadow_fd *sfd, struct render_data *rd)
 				ctx, &ctx->width, &ctx->height, linesize_align);
 	}
 
-	AVDictionary *open_opts = NULL;
-	if (mc_decoder) {
-		/* Force the pure-NDK MediaCodec wrapper (dlopens libmediandk):
-		 * no JavaVM and no JNI on the decoder thread. The AVOption
-		 * default (-1) auto-selects the JNI wrapper whenever a VM is
-		 * registered process-wide — this build captures none, but be
-		 * explicit so Godot JVM changes can never flip the choice. */
-		av_dict_set(&open_opts, "ndk_codec", "1", 0);
-	}
-	int open_err = avcodec_open2(ctx, codec, open_opts);
-	av_dict_free(&open_opts);
+	int open_err = avcodec_open2(ctx, codec, NULL);
 	if (open_err < 0) {
 		if (has_hw && hw_supported) {
 			/* The HW-configured context failed to open (e.g. no
@@ -1392,10 +1339,9 @@ int setup_video_decode(struct shadow_fd *sfd, struct render_data *rd)
 	/* will be allocated on frame receipt */
 	sfd->video_local_frame = NULL;
 	sfd->video_color_context = NULL;
-	DIAG_VIDEO_LOG("[decode-setup] ok ctx=%dx%d drm_fmt=0x%x av_fmt=%d hw=%d decoder=%s\n",
+	DIAG_VIDEO_LOG("[decode-setup] ok ctx=%dx%d drm_fmt=0x%x av_fmt=%d hw=%d\n",
 			ctx->width, ctx->height, sfd->dmabuf_info.format,
-			ctx->pix_fmt,
-			ctx->hw_device_ctx != NULL || mc_decoder, codec->name);
+			ctx->pix_fmt, ctx->hw_device_ctx != NULL);
 	return 0;
 }
 
@@ -1818,12 +1764,6 @@ void apply_video_packet(struct shadow_fd *sfd, struct render_data *rd,
 		}
 		return;
 	}
-	int lat_trace = wp_lat_enabled();
-	if (lat_trace) {
-		wp_lat_emit("[ftrace] t=%lld %s bytes=%d\n",
-				(long long)wp_lat_now_us(), "video_packet_in",
-				(int)msg->size);
-	}
 	sfd->video_packet->data = (uint8_t *)msg->data;
 	sfd->video_packet->size = (int)msg->size;
 
@@ -1888,14 +1828,6 @@ void apply_video_packet(struct shadow_fd *sfd, struct render_data *rd,
 		}
 		last_is_vaapi = false;
 	}
-
-	if (have_frame && lat_trace) {
-		/* Marks the end of the avcodec send/drain window: everything
-		 * before this point is codec time (HW MediaCodec blocking in
-		 * receive_frame), everything after is conversion. */
-		wp_lat_emit("[ftrace] t=%lld %s\n",
-				(long long)wp_lat_now_us(), "video_codec_out");
-	}
 	if (!have_frame || last_is_vaapi) {
 		/* Nothing decoded, or the newest frame was already handled
 		 * by the per-frame VAAPI conversion. */
@@ -1917,8 +1849,7 @@ void apply_video_packet(struct shadow_fd *sfd, struct render_data *rd,
 		 * falls through to the sws path below. */
 		const enum AVPixelFormat mfmt =
 				drm_to_av(sfd->dmabuf_info.format);
-		if ((mfmt == AV_PIX_FMT_BGR0 || mfmt == AV_PIX_FMT_RGB0) &&
-				cpu_frame->format == AV_PIX_FMT_YUV420P) {
+		if (mfmt == AV_PIX_FMT_BGR0 || mfmt == AV_PIX_FMT_RGB0) {
 			static int libyuv_path_announced = 0;
 			if (!libyuv_path_announced) {
 				libyuv_path_announced = 1;
@@ -2035,11 +1966,6 @@ void apply_video_packet(struct shadow_fd *sfd, struct render_data *rd,
 				wp_lat_video_record(&g_lat_video,
 						wp_lat_now_us() - lat_f0);
 			}
-			if (lat_trace) {
-				wp_lat_emit("[ftrace] t=%lld %s\n",
-						(long long)wp_lat_now_us(),
-						"video_frame_out");
-			}
 			return;
 		}
 	}
@@ -2128,10 +2054,6 @@ void apply_video_packet(struct shadow_fd *sfd, struct render_data *rd,
 			wp_lat_video_record(&g_lat_video,
 					wp_lat_now_us() - lat_f0);
 		}
-	if (lat_trace) {
-		wp_lat_emit("[ftrace] t=%lld %s\n",
-				(long long)wp_lat_now_us(), "video_frame_out");
-	}
 }
 
 
