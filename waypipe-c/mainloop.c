@@ -1489,8 +1489,14 @@ int main_interface_loop(int chanfd, int progfd, int linkfd,
 			poll_delay = 0;
 		} else if (own_msg_pending) {
 			/* To coalesce acknowledgements, we wait for a minimum
-			 * amount */
-			poll_delay = 20;
+			 * amount. 2 ms (was 20 ms): on a wireless stream the
+			 * unacked counter is almost always non-zero, so the old
+			 * value turned this loop into a 50 Hz timer and quantized
+			 * every frame-path hop to ~20 ms (measured 2026-09-11:
+			 * frame arrival -> compositor write p90 19.96 ms). The
+			 * polling wakeups below (chanfd/progfd/selfpipe) are
+			 * unaffected; this only bounds the ack batching window. */
+			poll_delay = 2;
 		} else {
 			poll_delay = -1;
 		}
